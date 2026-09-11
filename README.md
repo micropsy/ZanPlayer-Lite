@@ -1,8 +1,11 @@
 # ZanPlayer Lite
 
-A modern, beautiful desktop video player with **local, offline, AI-powered subtitle generation**, built with Tauri 2, React 19, TypeScript, and Tailwind CSS v4. **100% offline-first** — no external API keys, no cloud calls required.
+[![Build](https://github.com/micropsy/ZanPlayer-Lite/actions/workflows/build.yml/badge.svg)](https://github.com/micropsy/ZanPlayer-Lite/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/github/license/micropsy/ZanPlayer-Lite.svg)](https://opensource.org/licenses/MIT)
 
-> **ZanPlayer Lite is a complete re-architecture around a Native Whisper Core.** All transcription *and* translation runs through a single local `whisper-rs` (whisper.cpp) engine — purely native, fully offline, with no secondary model runtimes, no interpreter dependencies, and no cloud calls in the app or its shipped bundles.
+**ZanPlayer Lite** is a modern, beautiful desktop video player with **local, offline, AI-powered subtitle generation** — built with Tauri 2, React 19, TypeScript, and Tailwind CSS v4.
+
+**100% offline, 100% native, 100% local.** Every transcription *and* translation runs on your machine through a single bundled **Native Whisper Core** — `whisper-rs` (whisper.cpp). There are **zero Python or external ML dependencies**, no cloud calls, and no API keys. The only moving pieces are the Whisper model files you download from Settings and a bundled FFmpeg sidecar for audio extraction.
 
 ## Architecture — Native Whisper Core & Dual-Pass Inference
 
@@ -70,7 +73,22 @@ Everything below executes on your machine, on native threads:
 
 ## Installation
 
-### Prerequisites
+### Download (recommended)
+
+Grab the bundle for your platform from the [Releases page](https://github.com/micropsy/ZanPlayer-Lite/releases):
+
+| OS | Bundle |
+|----|--------|
+| macOS (Apple Silicon) | `.dmg` (aarch64) |
+| macOS (Intel) | `.dmg` (x64) |
+| Linux | `.AppImage` or `.deb` |
+| Windows | `.msi` |
+
+Releases are **signed**, and the built-in **auto-updater** keeps the app current — ZanPlayer Lite checks GitHub Releases on launch and installs updates in-app.
+
+### Build from Source
+
+#### Prerequisites
 1. **Node.js** (v20 or higher; CI uses v24)
 2. **Rust** (stable toolchain)
 3. Platform dependencies:
@@ -78,7 +96,7 @@ Everything below executes on your machine, on native threads:
    - **Linux**: `libwebkit2gtk-4.1-dev`, `build-essential`, `libssl-dev`, `libxdo-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, etc. (see `.github/workflows/build.yml`)
    - **Windows**: MSVC build tools
 
-### Steps
+#### Steps
 ```bash
 git clone https://github.com/micropsy/ZanPlayer-Lite.git
 cd ZanPlayer-Lite
@@ -86,7 +104,7 @@ npm install
 npm run tauri dev
 ```
 
-### Build & release
+#### Build & release
 ```bash
 npm run build         # type-check (tsc) + frontend build (vite)
 npm run tauri build   # full desktop bundles (app, dmg, AppImage, deb, msi)
@@ -95,7 +113,7 @@ npm run release -- patch   # semantic-version release pipeline (see RELEASE_PROC
 
 ## Offline AI — Where Things Live
 
-- **Whisper models** → app data `models/` directory, downloaded from Settings. Everything — transcription **and** translation — runs through the same native whisper.cpp engine (`whisper-rs`).
+- **Whisper models** → app data `models/` directory, downloaded from Settings. Everything — transcription **and** translation — runs through the same native whisper.cpp engine (`whisper-rs`). No other ML runtime is involved.
 - **FFmpeg** → bundled as a Tauri sidecar (`src-tauri/binaries/`) for audio extraction to 16 kHz mono WAV.
 
 ## Project Structure
@@ -148,12 +166,13 @@ ZanPlayer Lite/
 7. Edit cues in the sidebar editor and export when ready. **Click any cue** to jump the player (and the editor highlight) straight to that moment.
 8. **Save Project** (in the sidebar) writes a `.zan` file capturing the video, dual tracks, modes, and styling. **Load Project** restores the whole workspace instantly — transcription is never re-run.
 
-## Future Plans
+## Roadmap
 
 - [x] Tests for frontend and backend
 - [x] Click-to-seek from the subtitle editor into the player
 - [x] Project save/load (`.zan`)
 - [x] Seek-aware realtime transcription (streaming passes follow the playhead)
+- [ ] A refreshed UI/UX design pass — new player controls, settings, and playback experiences
 
 ## Testing
 

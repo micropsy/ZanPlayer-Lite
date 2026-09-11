@@ -3,9 +3,10 @@ import { render, screen, fireEvent, waitFor, cleanup, act } from "@testing-libra
 
 type EmitFn = (event: { payload?: unknown }) => void;
 
-const { listeners, invoke } = vi.hoisted(() => ({
+const { listeners, invoke, emit } = vi.hoisted(() => ({
   listeners: {} as Record<string, EmitFn>,
   invoke: vi.fn(),
+  emit: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -17,6 +18,7 @@ vi.mock("@tauri-apps/api/event", () => ({
     listeners[name] = cb;
     return Promise.resolve(() => {});
   },
+  emit,
 }));
 vi.mock("@tauri-apps/api/path", () => ({
   homeDir: vi.fn().mockResolvedValue("/home"),
@@ -52,6 +54,7 @@ describe("VideoPlayer dual-pass rendering", () => {
     localStorage.clear();
     Object.keys(listeners).forEach((k) => delete listeners[k]);
     invoke.mockReset();
+    emit.mockClear();
     useAppStore.setState({
       currentVideo: null,
       currentVideoUrl: "https://media.example/video.mp4",
@@ -67,6 +70,9 @@ describe("VideoPlayer dual-pass rendering", () => {
       transcriptionMode: "stream",
       sourceLanguage: "my",
       seekTo: null,
+      resumeAt: null,
+      recentFiles: [],
+      playbackRate: 1,
     });
   });
 
@@ -266,5 +272,133 @@ describe("VideoPlayer dual-pass rendering", () => {
 
     const seekCalls = invoke.mock.calls.filter(([cmd]) => cmd === "seek_transcription");
     expect(seekCalls).toHaveLength(0);
+  });
+});
+
+describe("VideoPlayer quality-of-life features", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    Object.keys(listeners).forEach((k) => delete listeners[k]);
+    invoke.mockReset();
+    emit.mockClear();
+    useAppStore.setState({
+      currentVideo: null,
+      currentVideoUrl: "https://media.example/video.mp4",
+      currentVideoPath: "/tmp/media.wav",
+      subtitleTracks: [],
+      activeSubtitleTrackId: null,
+      showSubtitles: false,
+      currentTime: 0,
+      isPlaying: false,
+      isTranscribing: false,
+      transcriptionProgress: 0,
+      subtitleMode: "english",
+      transcriptionMode: "stream",
+      sourceLanguage: "auto",
+      seekTo: null,
+      resumeAt: null,
+      recentFiles: [],
+      playbackRate: 1,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows the extracted filename as a title OSD on the loaded video", async () => {
+    invoke.mockImplementation(async () => undefined);
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    expect(screen.getByText("media.wav")).toBeTruthy();
+  });
+
+  it("clicking a recent-history item resumes playback at the saved timestamp", async () => {
+    useAppStore.setState({
+      currentVideoUrl: null,
+      currentVideoPath: null,
+      recentFiles: [
+        { path: "/videos/movie.mp4", fileName: "movie.mp4", lastPlayedTimestamp: 90 },
+      ],
+    });
+    render(<VideoPlayer />);
+
+    // Home-screen history list is shown on the empty state.
+    expect(screen.getByText("Recent History")).toBeTruthy();
+    expect(screen.getByText("movie.mp4")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("movie.mp4"));
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    await waitFor(() =>
+      expect(useAppStore.getState().currentVideoPath).toBe("/videos/movie.mp4")
+    );
+
+    // The one-shot resume request is consumed once the media is ready.
+    await waitFor(() => expect(useAppStore.getState().resumeAt).toBeNull());
+
+    // loadedmetadata applies the parked resume position before autoplay.
+    const video = document.querySelector("video") as HTMLVideoElement;
+    fireEvent.loadedMetadata(video);
+    expect(video.currentTime).toBe(90);
+    expect(useAppStore.getState().currentTime).toBe(90);
+
+    // The file stays in history (upsert preserved its saved position).
+    expect(useAppStore.getState().recentFiles[0].fileName).toBe("movie.mp4");
+  });
+
+  it("playback speed selector applies the rate to the store and the media element", async () => {
+    invoke.mockImplementation(async () => undefined);
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+
+    fireEvent.click(screen.getByTitle("Playback speed"));
+    fireEvent.click(screen.getByText("1.5x"));
+
+    expect(useAppStore.getState().playbackRate).toBe(1.5);
+    const video = document.querySelector("video") as HTMLVideoElement;
+    expect(video.playbackRate).toBe(1.5);
+  });
+
+  it("quick settings adjust subtitle size/color and the transcription mode", async () => {
+    invoke.mockImplementation(async () => undefined);
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+
+    fireEvent.click(screen.getByTitle("Quick Settings"));
+    expect(screen.getByText("Subtitle Size")).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("Subtitle Size"), { target: { value: "42" } });
+    expect(useAppStore.getState().subtitleStyle.fontSize).toBe(42);
+
+    fireEvent.change(screen.getByLabelText("Subtitle Color"), { target: { value: "#ff0000" } });
+    expect(useAppStore.getState().subtitleStyle.primaryColor).toBe("#ff0000");
+
+    fireEvent.click(screen.getByText("Full (Batch)"));
+    expect(useAppStore.getState().transcriptionMode).toBe("batch");
+
+    // Popover closes on outside interaction.
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByText("Subtitle Size")).toBeNull();
+  });
+
+  it("recent-history entries are removed from the list without loading the video", async () => {
+    useAppStore.setState({
+      currentVideoUrl: null,
+      currentVideoPath: null,
+      recentFiles: [
+        { path: "/videos/a.mp4", fileName: "a.mp4", lastPlayedTimestamp: 10 },
+        { path: "/videos/b.mp4", fileName: "b.mp4", lastPlayedTimestamp: 20 },
+      ],
+    });
+    render(<VideoPlayer />);
+
+    fireEvent.click(screen.getByLabelText("Remove b.mp4 from history"));
+    const files = useAppStore.getState().recentFiles.map((r) => r.fileName);
+    expect(files).toEqual(["a.mp4"]);
+    expect(screen.getByText("a.mp4")).toBeTruthy();
+    expect(screen.queryByText("b.mp4")).toBeNull();
   });
 });

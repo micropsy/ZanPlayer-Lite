@@ -244,3 +244,62 @@ describe("store loadProject hydration", () => {
     });
   });
 });
+
+describe("store recent history and playback rate", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({ recentFiles: [], playbackRate: 1, resumeAt: null });
+  });
+
+  it("upsertRecentFile adds new entries to the front and dedups by path", () => {
+    const s = useAppStore.getState();
+    s.upsertRecentFile("/v/a.mp4", "a.mp4");
+    s.upsertRecentFile("/v/b.mp4", "b.mp4");
+    s.upsertRecentFile("/v/a.mp4", "a.mp4"); // dedupe, keeps lastPlayedTimestamp 0
+    const files = useAppStore.getState().recentFiles;
+    expect(files.map((f) => f.fileName)).toEqual(["a.mp4", "b.mp4"]);
+    expect(files[0].lastPlayedTimestamp).toBe(0);
+  });
+
+  it("touchRecentFile preserves existing entries and updates the playhead", () => {
+    const s = useAppStore.getState();
+    s.upsertRecentFile("/v/a.mp4", "a.mp4");
+    s.upsertRecentFile("/v/b.mp4", "b.mp4");
+    s.touchRecentFile("/v/a.mp4", 42);
+    const fileA = useAppStore.getState().recentFiles.find((f) => f.path === "/v/a.mp4");
+    expect(fileA?.lastPlayedTimestamp).toBe(42);
+    expect(useAppStore.getState().recentFiles[0].fileName).toBe("a.mp4");
+  });
+
+  it("touchRecentFile no-ops for unknown paths (no history entry created)", () => {
+    useAppStore.getState().touchRecentFile("/v/ghost.mp4", 5);
+    expect(useAppStore.getState().recentFiles).toHaveLength(0);
+  });
+
+  it("removeRecentFile removes only the requested entry", () => {
+    const s = useAppStore.getState();
+    s.upsertRecentFile("/v/a.mp4", "a.mp4");
+    s.upsertRecentFile("/v/b.mp4", "b.mp4");
+    s.removeRecentFile("/v/a.mp4");
+    expect(useAppStore.getState().recentFiles.map((f) => f.fileName)).toEqual(["b.mp4"]);
+  });
+
+  it("caps history at 20 entries, dropping the oldest", () => {
+    const s = useAppStore.getState();
+    for (let i = 0; i < 25; i++) s.upsertRecentFile(`/v/${i}.mp4`, `${i}.mp4`);
+    const files = useAppStore.getState().recentFiles;
+    expect(files).toHaveLength(20);
+    expect(files[0].fileName).toBe("24.mp4");
+    expect(files[files.length - 1].fileName).toBe("5.mp4");
+  });
+
+  it("playback rate defaults to 1, updates via the store, and resumeAt is one-shot", () => {
+    expect(useAppStore.getState().playbackRate).toBe(1);
+    useAppStore.getState().setPlaybackRate(1.5);
+    expect(useAppStore.getState().playbackRate).toBe(1.5);
+
+    expect(useAppStore.getState().resumeAt).toBeNull();
+    useAppStore.getState().setResumeAt(77);
+    expect(useAppStore.getState().resumeAt).toBe(77);
+  });
+});

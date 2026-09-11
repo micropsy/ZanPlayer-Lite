@@ -1,5 +1,5 @@
 import { useRef, useState, useEffect, useCallback } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listen, emit } from "@tauri-apps/api/event";
 import { useAppStore, whisperLangCode } from "../services/store";
 import {
   Play,
@@ -15,6 +15,9 @@ import {
   Loader2,
   ChevronRight,
   ChevronLeft,
+  Settings2,
+  History,
+  X,
 } from "lucide-react";
 import { cn } from "../utils/cn";
 import { TauriService, isTauri, type TranscriptionBatchDonePayload } from "../services/tauri";
@@ -58,6 +61,9 @@ const GEN_MODES = [
 const ORIGINAL_TRACK_NAME = "Auto-Generated (Original)";
 const TRANSLATION_TRACK_NAME = "Auto-Generated (English)";
 
+// Standard media-player playback speeds, cycled/selected from the control bar.
+const SPEED_RATES = [0.5, 1, 1.25, 1.5, 2] as const;
+
 export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [showControls, setShowControls] = useState(true);
@@ -67,10 +73,17 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const [videoSource, setVideoSource] = useState<string | null>(null);
   const [showCCMenu, setShowCCMenu] = useState(false);
   const [ccMenuView, setCcMenuView] = useState<"root" | "source" | "output" | "genmode">("root");
+  const [showQuickSettings, setShowQuickSettings] = useState(false);
+  const [showSpeedMenu, setShowSpeedMenu] = useState(false);
   const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
   const {
+    currentVideo,
     currentVideoUrl,
     currentVideoPath,
+    setCurrentVideo,
+    setCurrentVideoUrl,
+    setCurrentVideoPath,
+    resetSubtitles,
     setCurrentTime,
     isPlaying,
     setIsPlaying,
@@ -81,6 +94,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     seekTo,
     setSeekTo,
     subtitleStyle,
+    setSubtitleStyle,
     sourceLanguage,
     setSourceLanguage,
     subtitleMode,
@@ -91,11 +105,26 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     setIsTranscribing,
     transcriptionProgress,
     setTranscriptionProgress,
+    playbackRate,
+    setPlaybackRate,
+    recentFiles,
+    upsertRecentFile,
+    touchRecentFile,
+    removeRecentFile,
+    resumeAt,
+    setResumeAt,
   } = useAppStore();
 
   const controlsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingPlayRef = useRef(false);
   const transcriptionGenerationRef = useRef(0);
+  // Resume-at-load: the media element is still buffering when a recent-history
+  // item is opened, so the target position is parked here and applied on the
+  // next `loadedmetadata` (the store `resumeAt` request is consumed in the same
+  // render the source becomes available, to avoid a stale jump later).
+  const pendingResumeRef = useRef<number | null>(null);
+  // Throttle the periodic recent-position save while a video is playing.
+  const lastRecentSaveRef = useRef(0);
   // Live streamed tracks / job identity. Cues are polled from the Rust render
   // queue while a job is active and routed to these by `kind`.
   const originalStreamTrackIdRef = useRef<string | null>(null);
@@ -140,8 +169,20 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     // the optimistic clock and regress the editor highlight.
     if (videoRef.current && !pendingSeekRef.current) {
       setCurrentTime(videoRef.current.currentTime);
+      maybeRecordPlayback();
     }
   };
+
+  // Periodically save the live playhead into the recent-history entry (at most
+  // every 5s while playing). Pause/ended/unmount write the exact position.
+  const maybeRecordPlayback = useCallback(() => {
+    const s = useAppStore.getState();
+    if (!s.currentVideoPath) return;
+    const now = performance.now();
+    if (now - lastRecentSaveRef.current < 5000) return;
+    lastRecentSaveRef.current = now;
+    touchRecentFile(s.currentVideoPath, s.currentTime);
+  }, [touchRecentFile]);
 
   const clearPendingSeek = () => {
     pendingSeekRef.current = false;
@@ -181,11 +222,12 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     if (controlsTimeoutRef.current) {
       clearTimeout(controlsTimeoutRef.current);
     }
-    controlsTimeoutRef.current = setTimeout(() => {
-      if (isPlaying) {
+    // Don't auto-hide while a menu is open — the user is reading an option.
+    if (isPlaying && !showCCMenu && !showSpeedMenu && !showQuickSettings) {
+      controlsTimeoutRef.current = setTimeout(() => {
         setShowControls(false);
-      }
-    }, 3000);
+      }, 3000);
+    }
   };
 
   const toggleMute = () => {
@@ -305,18 +347,24 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
   }, []);
 
-  // Close CC menu when clicking outside
+  // Close CC menu, speed menu, and quick-settings popover when clicking outside
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
       if (showCCMenu && !target.closest('[data-cc-menu]')) {
         setShowCCMenu(false);
       }
+      if (showSpeedMenu && !target.closest('[data-speed-menu]')) {
+        setShowSpeedMenu(false);
+      }
+      if (showQuickSettings && !target.closest('[data-quick-settings]')) {
+        setShowQuickSettings(false);
+      }
     };
 
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [showCCMenu]);
+  }, [showCCMenu, showSpeedMenu, showQuickSettings]);
 
   // Handle seeking dispatched from the subtitle editor (or anywhere else). The
   // store clock advances optimistically so the editor highlight moves the same
@@ -361,6 +409,78 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     },
     []
   );
+
+  // ---------------------------------------------------------------------------
+  // Quality-of-life: resume-at-load, recent-history tracking, playback speed,
+  // and popover auto-close when the controls bar hides itself.
+  // ---------------------------------------------------------------------------
+
+  // Consume a one-shot resume request (recent-history click). If the media
+  // element is already ready, seek immediately; otherwise park the target so
+  // `loadedmetadata` picks it up. The store `resumeAt` field is cleared in the
+  // same render the source becomes available, to prevent a stale re-fire on a
+  // future load.
+  useEffect(() => {
+    if (resumeAt === null) return;
+    const video = videoRef.current;
+    if (!video || !videoSource) return;
+    const target = resumeAt;
+    setResumeAt(null);
+    if (video.readyState >= 1) {
+      const clamped = Math.max(0, Math.min(video.duration || target, target));
+      video.currentTime = clamped;
+      setCurrentTime(clamped);
+      notifyPipelineSeekRef.current(clamped);
+    } else {
+      pendingResumeRef.current = target;
+    }
+  }, [resumeAt, videoSource, setResumeAt, setCurrentTime]);
+
+  // Apply playback speed to any freshly loaded video and re-apply when the
+  // user picks a new rate while a video is already running.
+  useEffect(() => {
+    if (!videoSource || !videoRef.current) return;
+    videoRef.current.playbackRate = playbackRate;
+  }, [playbackRate, videoSource]);
+
+  // Upsert a recent-history entry each time a new path is loaded so the home
+  // screen always lists it. Existing `lastPlayedTimestamp` values are preserved;
+  // the dedicated `touchRecentFile` writes are responsible for updating the
+  // playhead position.
+  useEffect(() => {
+    if (!currentVideoPath) return;
+    const name = currentVideoPath.split(/[\\/]/).pop() || "Untitled";
+    upsertRecentFile(currentVideoPath, name);
+  }, [currentVideoPath, upsertRecentFile]);
+
+  // Persist the playhead on pause / ended (the `isPlaying` flag flips to
+  // false in both cases). The throttle inside `maybeRecordPlayback` covers
+  // periodic mid-playback saves; this handler catches the final position
+  // a timed save may miss.
+  useEffect(() => {
+    if (isPlaying) return;
+    const s = useAppStore.getState();
+    if (s.currentVideoPath) touchRecentFile(s.currentVideoPath, s.currentTime);
+  }, [isPlaying, touchRecentFile]);
+
+  // Last-chance save when the player unmounts (tab close, drag new file, etc.)
+  useEffect(
+    () => () => {
+      const s = useAppStore.getState();
+      if (s.currentVideoPath) s.touchRecentFile(s.currentVideoPath, s.currentTime);
+    },
+    []
+  );
+
+  // When the controls bar auto-hides (user idle while playing), dismiss any
+  // open popover so it doesn't linger as a ghost over the video.
+  useEffect(() => {
+    if (!showControls) {
+      setShowCCMenu(false);
+      setShowSpeedMenu(false);
+      setShowQuickSettings(false);
+    }
+  }, [showControls]);
 
   const sortCues = (list: SubtitleCue[]) =>
     [...list].sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime);
@@ -672,10 +792,61 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     regenerateForVideo();
   };
 
+  // Open a previously-watched video from the home-screen recent list. The
+  // video is loaded through the same blob-URL path as drag/drop, then a
+  // one-shot `resumeAt` field is dispatched so the player seeks to the saved
+  // playhead position once `loadedmetadata` fires.
+  const openRecentFile = async (filePath: string, timestamp: number) => {
+    if (!isTauri()) return;
+    try {
+      const url = await TauriService.getVideoBlobUrl(filePath);
+      resetSubtitles();
+      setCurrentVideo(null);
+      setCurrentVideoUrl(url);
+      setCurrentVideoPath(filePath);
+      setResumeAt(timestamp);
+      emit("zanplayer-lite:video-dropped");
+    } catch (err) {
+      console.error("Failed to resume video:", err);
+      removeRecentFile(filePath);
+    }
+  };
+
+  // Quick-settings / speed popovers – mutually exclusive with the CC menu.
+  const toggleSpeedMenu = () => {
+    if (showSpeedMenu) setShowSpeedMenu(false);
+    else {
+      setShowSpeedMenu(true);
+      setShowCCMenu(false);
+      setShowQuickSettings(false);
+    }
+  };
+
+  const toggleQuickSettings = () => {
+    if (showQuickSettings) setShowQuickSettings(false);
+    else {
+      setShowQuickSettings(true);
+      setShowCCMenu(false);
+      setShowSpeedMenu(false);
+    }
+  };
+
+  const applyPlaybackRate = (rate: number) => {
+    setPlaybackRate(rate);
+    if (videoRef.current) videoRef.current.playbackRate = rate;
+    setShowSpeedMenu(false);
+  };
+
   const outputModeLabel =
     OUTPUT_MODES.find((m) => m.value === subtitleMode)?.name ?? "English Only";
   const genModeLabel =
     transcriptionMode === "batch" ? "Full (Batch)" : "Realtime (Streaming)";
+
+  // Filename shown in the title OSD (derived from the real filesystem path, or
+  // the browser-dropped File when no path exists).
+  const videoTitle = currentVideoPath
+    ? currentVideoPath.split(/[\\/]/).pop() || null
+    : currentVideo?.name || null;
 
   return (
     <div
@@ -702,6 +873,18 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
               if (videoRef.current) {
                 videoRef.current.volume = volume;
                 videoRef.current.muted = isMuted;
+                videoRef.current.playbackRate = playbackRate;
+                // One-shot resume for recent-history clicks: the playhead jumps
+                // to the saved position before playback starts so the user picks
+                // up exactly where they left off.
+                if (pendingResumeRef.current != null) {
+                  const target = pendingResumeRef.current;
+                  pendingResumeRef.current = null;
+                  const clamped = Math.max(0, Math.min(videoRef.current.duration || target, target));
+                  videoRef.current.currentTime = clamped;
+                  setCurrentTime(clamped);
+                  notifyPipelineSeekRef.current(clamped);
+                }
                 // Autoplay the moment media is ready. Transcription never blocks
                 // playback in V2 — captions stream in behind the video.
                 if (pendingPlayRef.current) {
@@ -724,6 +907,18 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
                   <p className="text-gray-400 text-sm">Audio File</p>
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* Video Title OSD — fades in/out with the control bar */}
+          {videoTitle && (
+            <div
+              className={cn(
+                "absolute top-0 left-0 right-0 bg-gradient-to-b from-black/80 to-transparent px-6 py-4 transition-opacity duration-300 pointer-events-none z-10",
+                showControls ? "opacity-100" : "opacity-0"
+              )}
+            >
+              <h1 className="text-white text-base font-semibold truncate">{videoTitle}</h1>
             </div>
           )}
 
@@ -882,11 +1077,52 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
               </div>
 
               <div className="flex items-center gap-3">
+                {/* Playback speed selector */}
+                <div className="relative" data-speed-menu>
+                  <button
+                    onClick={toggleSpeedMenu}
+                    className={cn(
+                      "flex items-center justify-center py-0.5 px-2 rounded-[4px] border transition-colors text-xs font-semibold",
+                      showSpeedMenu
+                        ? "text-zan-cyan border-zan-cyan/70 bg-zan-cyan/10"
+                        : "text-white/80 border-white/70 hover:text-zan-cyan hover:border-zan-cyan/70"
+                    )}
+                    title="Playback speed"
+                  >
+                    {playbackRate}x
+                  </button>
+
+                  {showSpeedMenu && (
+                    <div className="absolute bottom-full right-0 mb-3 bg-zan-black/95 backdrop-blur rounded-xl shadow-2xl border border-gray-700 min-w-[130px] overflow-hidden">
+                      {SPEED_RATES.map((rate) => (
+                        <button
+                          key={rate}
+                          onClick={() => applyPlaybackRate(rate)}
+                          className={cn(
+                            "w-full flex items-center justify-between gap-3 px-3 py-2 text-sm transition-colors",
+                            playbackRate === rate
+                              ? "text-zan-cyan bg-zan-blue/25"
+                              : "text-gray-300 hover:bg-zan-blue/15"
+                          )}
+                        >
+                          {rate}x
+                          {playbackRate === rate && <CheckCircle2 className="w-4 h-4" />}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
                 <div className="relative" data-cc-menu>
                   <button
                     onClick={() => {
-                      setShowCCMenu(!showCCMenu);
-                      if (showCCMenu) setCcMenuView("root");
+                      if (showCCMenu) setShowCCMenu(false);
+                      else {
+                        setShowCCMenu(true);
+                        setShowSpeedMenu(false);
+                        setShowQuickSettings(false);
+                        setCcMenuView("root");
+                      }
                     }}
                     className={cn(
                       "flex items-center justify-center py-0.5 px-1 rounded-[4px] border transition-colors",
@@ -1089,6 +1325,121 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
                     </div>
                   )}
                 </div>
+
+                {/* Quick Settings gear */}
+                <div className="relative" data-quick-settings>
+                  <button
+                    onClick={toggleQuickSettings}
+                    className={cn(
+                      "p-0.5 rounded-[4px] transition-colors",
+                      showQuickSettings
+                        ? "text-zan-cyan"
+                        : "text-white hover:text-zan-cyan"
+                    )}
+                    title="Quick Settings"
+                  >
+                    <Settings2 className="w-6 h-6" />
+                  </button>
+
+                  {showQuickSettings && (
+                    <div className="absolute bottom-28 right-0 z-30 w-72 bg-zan-black/95 backdrop-blur rounded-xl shadow-2xl border border-gray-700 p-4">
+                      <h3 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
+                        <Settings2 className="w-4 h-4" />
+                        Quick Settings
+                      </h3>
+
+                      <div className="space-y-4">
+                        {/* Subtitle Size */}
+                        <div>
+                          <label className="text-xs text-gray-400 block mb-1.5 font-medium">
+                            Subtitle Size
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="range"
+                              min="12"
+                              max="72"
+                              value={subtitleStyle.fontSize}
+                              onChange={(e) =>
+                                setSubtitleStyle({ fontSize: parseInt(e.target.value, 10) })
+                              }
+                              aria-label="Subtitle Size"
+                              className="flex-1 h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-zan-cyan"
+                            />
+                            <span className="w-10 text-right text-xs text-white font-mono">
+                              {subtitleStyle.fontSize}px
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Subtitle Color */}
+                        <div>
+                          <label className="text-xs text-gray-400 block mb-1.5 font-medium">
+                            Subtitle Color
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <span className="relative h-8 w-10 rounded-lg border border-gray-600 overflow-hidden shrink-0">
+                              <span
+                                className="absolute inset-0"
+                                style={{ background: subtitleStyle.primaryColor }}
+                              />
+                              <input
+                                type="color"
+                                value={subtitleStyle.primaryColor}
+                                onChange={(e) =>
+                                  setSubtitleStyle({ primaryColor: e.target.value })
+                                }
+                                aria-label="Subtitle Color"
+                                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                              />
+                            </span>
+                            <input
+                              type="text"
+                              value={subtitleStyle.primaryColor}
+                              onChange={(e) =>
+                                setSubtitleStyle({ primaryColor: e.target.value })
+                              }
+                              spellCheck={false}
+                              className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg text-xs font-mono border bg-zan-black/60 border-gray-700/60 text-gray-100 focus:outline-none focus:ring-1 focus:ring-zan-cyan"
+                            />
+                          </div>
+                        </div>
+
+                        {/* Transcription Mode */}
+                        <div>
+                          <label className="text-xs text-gray-400 block mb-1.5 font-medium">
+                            Transcription Mode
+                          </label>
+                          <div className="flex p-0.5 rounded-lg border border-gray-700/60 bg-zan-black/60">
+                            <button
+                              onClick={() => setTranscriptionMode("stream")}
+                              className={cn(
+                                "px-3 py-1 rounded-md text-xs font-medium transition-colors flex-1",
+                                transcriptionMode === "stream"
+                                  ? "bg-zan-cyan/15 text-zan-cyan"
+                                  : "text-gray-400 hover:text-white"
+                              )}
+                            >
+                              Realtime
+                            </button>
+                            <button
+                              onClick={() => setTranscriptionMode("batch")}
+                              className={cn(
+                                "px-3 py-1 rounded-md text-xs font-medium transition-colors flex-1",
+                                transcriptionMode === "batch"
+                                  ? "bg-zan-cyan/15 text-zan-cyan"
+                                  : "text-gray-400 hover:text-white"
+                              )}
+                            >
+                              Full (Batch)
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 <button
                   onClick={toggleFullscreen}
                   className="text-white hover:text-zan-cyan transition-colors"
@@ -1100,7 +1451,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
           </div>
         </>
       ) : (
-        <div className="flex flex-col items-center justify-center w-full h-full text-gray-500">
+        <div className="flex flex-col items-center justify-center w-full h-full text-gray-500 overflow-y-auto px-6 py-8">
           <FileVideo className="w-16 h-16 mb-4 opacity-50" />
           <p className="text-lg">Select a video or audio file to start</p>
           <div className="mt-6 text-sm text-gray-600 max-w-md text-center">
@@ -1113,6 +1464,46 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
               <span><kbd className="bg-zan-black px-2 py-1 rounded">F</kbd> Fullscreen</span>
             </div>
           </div>
+
+          {/* Recent History */}
+          {recentFiles.length > 0 && (
+            <div className="mt-10 w-full max-w-md">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 flex items-center gap-2 mb-3">
+                <History className="w-4 h-4" />
+                Recent History
+              </h3>
+              <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                {recentFiles.map((item) => (
+                  <div
+                    key={item.path}
+                    onClick={() => openRecentFile(item.path, item.lastPlayedTimestamp)}
+                    className="w-full flex items-center justify-between gap-3 px-4 py-3 rounded-xl text-left border border-white/10 bg-white/5 hover:bg-white/10 transition-colors cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <FileVideo className="w-5 h-5 text-gray-400 shrink-0" />
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-gray-200 truncate">{item.fileName}</p>
+                        <p className="text-xs text-gray-500">
+                          Resume at {formatTime(item.lastPlayedTimestamp)}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removeRecentFile(item.path);
+                      }}
+                      className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-500/20 rounded-lg text-gray-400 hover:text-red-400 transition-all shrink-0"
+                      title="Remove from history"
+                      aria-label={`Remove ${item.fileName} from history`}
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

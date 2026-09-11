@@ -26,6 +26,17 @@ export interface SubtitleStyle {
     alignment: "bottom" | "top";
 }
 
+// A previously-opened media file, tracked so the home screen can offer
+// one-click resume. `lastPlayedTimestamp` is the saved playhead position in
+// seconds (0 when the file was opened but never played).
+export interface RecentFile {
+    path: string;
+    fileName: string;
+    lastPlayedTimestamp: number;
+}
+
+const MAX_RECENT_FILES = 20;
+
 // Full display names -> whisper ISO-639-1 codes. whisper.cpp's `g_lang` table only
 // resolves ISO codes ("en", "my") or its own full names ("english", "myanmar");
 // any other string yields lang_id == -1 and then indexes `ailang_2_tok[-1]` out of
@@ -155,6 +166,16 @@ interface AppState {
     seekTo: number | null;
     setSeekTo: (time: number | null) => void;
 
+    // Resume playback (one-shot, consumed by the player when the media loads)
+    resumeAt: number | null;
+    setResumeAt: (time: number | null) => void;
+
+    // Recent history
+    recentFiles: RecentFile[];
+    upsertRecentFile: (path: string, fileName: string) => void;
+    touchRecentFile: (path: string, timestamp: number) => void;
+    removeRecentFile: (path: string) => void;
+
     // Settings
     theme: "dark" | "light";
     setTheme: (theme: "dark" | "light") => void;
@@ -174,6 +195,8 @@ interface AppState {
     setIsTranscribing: (val: boolean) => void;
     transcriptionProgress: number;
     setTranscriptionProgress: (progress: number) => void;
+    playbackRate: number;
+    setPlaybackRate: (rate: number) => void;
 
     // Model management
     downloadedModels: string[];
@@ -385,6 +408,43 @@ export const useAppStore = create<AppState>()(
             seekTo: null,
             setSeekTo: (time: number | null) => set({ seekTo: time }),
 
+            // Resume playback
+            resumeAt: null,
+            setResumeAt: (time: number | null) => set({ resumeAt: time }),
+
+            // Recent history
+            recentFiles: [],
+            upsertRecentFile: (path, fileName) =>
+                set((state) => {
+                    const existing = state.recentFiles.find((r) => r.path === path);
+                    const entry: RecentFile = {
+                        path,
+                        fileName,
+                        lastPlayedTimestamp: existing?.lastPlayedTimestamp ?? 0,
+                    };
+                    return {
+                        recentFiles: [
+                            entry,
+                            ...state.recentFiles.filter((r) => r.path !== path),
+                        ].slice(0, MAX_RECENT_FILES),
+                    };
+                }),
+            touchRecentFile: (path, timestamp) =>
+                set((state) => {
+                    const existing = state.recentFiles.find((r) => r.path === path);
+                    if (!existing) return {};
+                    return {
+                        recentFiles: [
+                            { ...existing, lastPlayedTimestamp: timestamp },
+                            ...state.recentFiles.filter((r) => r.path !== path),
+                        ].slice(0, MAX_RECENT_FILES),
+                    };
+                }),
+            removeRecentFile: (path) =>
+                set((state) => ({
+                    recentFiles: state.recentFiles.filter((r) => r.path !== path),
+                })),
+
             // Settings
             theme: "dark",
             setTheme: (theme: "dark" | "light") => set({ theme }),
@@ -404,6 +464,8 @@ export const useAppStore = create<AppState>()(
             setIsTranscribing: (val: boolean) => set({ isTranscribing: val }),
             transcriptionProgress: 0,
             setTranscriptionProgress: (progress: number) => set({ transcriptionProgress: progress }),
+            playbackRate: 1,
+            setPlaybackRate: (rate: number) => set({ playbackRate: rate }),
 
             // Model management
             downloadedModels: [],
@@ -527,6 +589,8 @@ export const useAppStore = create<AppState>()(
                 subtitleMode: state.subtitleMode,
                 transcriptionMode: state.transcriptionMode,
                 autoCheckUpdates: state.autoCheckUpdates,
+                playbackRate: state.playbackRate,
+                recentFiles: state.recentFiles,
             }),
         }
     )

@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+out/
+target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Tauri
+src-tauri/target/
+# Machine-specific FFmpeg sidecar binary (see README)
+src-tauri/binaries/
+
+# Private key (keep secret!)
+zanplayer-lite.key
+
+# Local machine backups
+backups/
+
+# Icon source (regenerate via: tauri icon src-tauri/app-icon.png)
+src-tauri/app-icon.png
+
+# Local build/ship artifacts
+ZanPlayer Lite-macos.zip

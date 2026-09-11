@@ -1,0 +1,34 @@
+[package]
+name = "zanplayer-lite"
+version = "0.0.1"
+description = "A modern, AI-powered subtitle player"
+authors = ["you"]
+license = "MIT"
+repository = "https://github.com/micropsy/ZanPlayer-Lite.git"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.6.2", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2.7.1"
+tauri-plugin-fs = "2.5.1"
+tauri-plugin-http = "2.5.9"
+tauri-plugin-shell = "2.3.5"
+tauri-plugin-updater = "2.10.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["stream"] }
+futures-util = "0.3"
+whisper-rs = "0.16"
+silero-vad-pure = "0.1.1"
+crossbeam-channel = "0.5"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+directories-next = "2.0"
+regex = "1.10"
+hound = "3.5"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

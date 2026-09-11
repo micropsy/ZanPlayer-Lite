@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Main capability for ZanPlayer Lite app",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "dialog:allow-ask",
+    "fs:default",
+    "fs:allow-app-read-recursive",
+    "fs:allow-app-write-recursive",
+    "fs:allow-app-meta-recursive",
+    "http:default",
+    "updater:default"
+  ]
+}

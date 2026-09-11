@@ -1,0 +1,57 @@
+{
+  "productName": "ZanPlayer Lite",
+  "version": "0.0.1",
+  "identifier": "com.micropsy.zanplayer-lite",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "ZanPlayer Lite",
+        "width": 1200,
+        "height": 800,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$HOME/**", "/Volumes/**", "$APPDATA/**", "$APPLOCALDATA/**"]
+      },
+      "capabilities": ["main"]
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    },
+    "updater": {
+      "endpoints": [
+        "https://github.com/micropsy/ZanPlayer-Lite/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE1NjY2NUZEREM2NTNCNEEKUldSS08yWGMvV1ZtcGRVS3VjSDEyb3pqVUNaTE50dkdVeXhEQ0czOTdOVW9nYkdQdkRYZlk1TU8K",
+      "installMode": "passive"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": "all",
+    "externalBin": ["binaries/ffmpeg"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  }
+}

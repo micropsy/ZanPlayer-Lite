@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+@theme {
+  --color-zan-cyan: #61d0d4;
+  --color-zan-blue: #1954a6;
+  --color-zan-deep: #0b3c73;
+  --color-zan-black: #0a0d14;
+  --color-zan-silver: #c0c0c0;
+
+  --animate-modal-in: modal-in 0.25s ease-out;
+  --animate-modal-backdrop-in: modal-backdrop-in 0.2s ease-out;
+
+  @keyframes modal-in {
+    from {
+      opacity: 0;
+      transform: scale(0.96) translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1) translateY(0);
+    }
+  }
+
+  @keyframes modal-backdrop-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+}

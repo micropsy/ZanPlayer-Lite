@@ -1,0 +1,1 @@
+{"main":{"identifier":"main","description":"Main capability for ZanPlayer Lite app","local":true,"windows":["main"],"permissions":["core:default","dialog:default","dialog:allow-ask","fs:default","fs:allow-app-read-recursive","fs:allow-app-write-recursive","fs:allow-app-meta-recursive","http:default","updater:default"]}}

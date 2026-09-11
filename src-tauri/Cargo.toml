@@ -1,6 +1,6 @@
 [package]
 name = "zanplayer-lite"
-version = "0.1.0"
+version = "0.1.1"
 description = "A modern, AI-powered subtitle player"
 authors = ["you"]
 license = "MIT"

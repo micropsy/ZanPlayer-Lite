@@ -97,15 +97,15 @@ video on every supported native backend.
 
 ### 7. Add Web App Install Support (PWA)
 
-- [ ] Add a web app manifest with name, short name, icons, theme colors and display mode.
-- [ ] Add 192px and 512px install icons.
-- [ ] Add a service worker for app-shell caching and offline startup behavior.
-- [ ] Register the service worker only in production/web builds.
-- [ ] Add install capability detection for Chrome/Edge Android and desktop.
-- [ ] Add an install action in the UI only when the browser supports installation.
-- [ ] Verify iOS/iPadOS Add to Home Screen behavior and safe-area layout.
-- [ ] Document that browser Web App playback uses HTML5 and browser codec support.
-- [ ] Keep local Whisper model storage and permissions explicit for the Web App.
+- [x] Add a web app manifest with name, short name, icons, theme colors and display mode.
+- [x] Add 192px and 512px install icons.
+- [x] Add a service worker for app-shell caching and offline startup behavior.
+- [x] Register the service worker only in production/web builds.
+- [x] Add install capability detection for Chrome/Edge Android and desktop.
+- [x] Add an install action in the UI only when the browser supports installation.
+- [ ] Verify iOS/iPadOS Add to Home Screen behavior and safe-area layout (needs a real device).
+- [x] Document that browser Web App playback uses HTML5 and browser codec support.
+- [x] Keep local Whisper model storage and permissions explicit for the Web App.
 
 Acceptance: the Web App can be installed from a supported browser, opens in a
 standalone window, retains the app shell offline, and never claims native mpv,
@@ -142,16 +142,16 @@ and do not break normal HTML5 playback.
 
 ### 11. Documentation and Release Matrix
 
-- [ ] Update README with platform/backend support and verification status.
-- [ ] Document Android JDK/SDK and iOS Xcode prerequisites.
-- [ ] Document PWA installation and browser limitations.
+- [x] Update README with platform/backend support and verification status.
+- [x] Document Android JDK/SDK and iOS Xcode prerequisites.
+- [x] Document PWA installation and browser limitations.
 - [ ] Publish a tested media-format matrix.
-- [ ] Run `npm run build`.
-- [ ] Run `npm run test`.
-- [ ] Run `cargo test`.
-- [ ] Run `cargo test --features native-player,macos-render` on macOS.
+- [x] Run `npm run build`.
+- [x] Run `npm run test`.
+- [x] Run `cargo test`.
+- [x] Run `cargo test --features native-player,macos-render` on macOS.
 - [ ] Run platform builds where toolchains are available.
-- [ ] Mark untested platforms as unverified instead of claiming support.
+- [x] Mark untested platforms as unverified instead of claiming support.
 
 Acceptance: release notes clearly distinguish implemented, device-tested and
 unsupported functionality.

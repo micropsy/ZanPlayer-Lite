@@ -3,9 +3,10 @@ import { Sidebar } from './components/Sidebar';
 import { VideoPlayer } from './components/VideoPlayer';
 import { SubtitleEditor } from './components/SubtitleEditor';
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Menu, FileVideo } from 'lucide-react';
+import { Menu, FileVideo, Download } from 'lucide-react';
 import { listen, emit } from '@tauri-apps/api/event';
 import { TauriService, isTauri } from './services/tauri';
+import { useInstallPrompt } from './hooks/useInstallPrompt';
 import { checkForUpdates } from './services/updater';
 import { UpdateModal } from './components/UpdateModal';
 import { isVideoFile, isAudioFile, isSubtitleFile, isParsableSubtitleFile } from './common/mediaFormats';
@@ -23,6 +24,7 @@ function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
+  const { canInstall, promptInstall } = useInstallPrompt();
 
   // Helper to parse SRT
   const parseSRT = (text: string) => {
@@ -287,12 +289,27 @@ function App() {
       )}
       {sidebarVisible && <Sidebar />}
       <div className="relative min-w-0 flex-1">
+        {!isTauri() && canInstall && (
+          <button
+            onClick={() => void promptInstall()}
+            aria-label="Install app"
+            title="Install ZanPlayer Lite on this device"
+            className={`absolute right-4 pwa-safe-top z-40 flex h-10 items-center gap-1.5 rounded-xl border px-3 text-sm font-medium transition-colors ${
+              theme === 'dark'
+                ? 'border-white/10 bg-zan-black/90 text-white shadow-xl shadow-black/20 hover:bg-zan-deep'
+                : 'border-gray-200 bg-white/95 text-gray-900 shadow-xl shadow-gray-300/30 hover:bg-gray-100'
+            }`}
+          >
+            <Download className="h-4 w-4" />
+            Install app
+          </button>
+        )}
         {!sidebarVisible && (
           <button
             onClick={() => setSidebarVisible(true)}
             aria-label="Open sidebar"
             title="Open sidebar"
-            className={`absolute top-4 left-4 z-40 flex h-10 w-10 items-center justify-center rounded-xl border transition-colors ${
+            className={`absolute left-4 pwa-safe-top z-40 flex h-10 w-10 items-center justify-center rounded-xl border transition-colors ${
               theme === 'dark'
                 ? 'border-white/10 bg-zan-black/90 text-white shadow-xl shadow-black/20 hover:bg-zan-deep'
                 : 'border-gray-200 bg-white/95 text-gray-900 shadow-xl shadow-gray-300/30 hover:bg-gray-100'

@@ -91,9 +91,13 @@ export interface ProjectData {
   currentTime: number;
 }
 
-// Check if we're running in a Tauri environment
-export const isTauri = () => {
-  return true;
+// Check if we're running inside the Tauri webview. Tauri injects
+// `window.__TAURI_INTERNALS__` at runtime; plain browsers (including the PWA
+// installed from a browser) do not have it, so every native call in this file
+// falls back cleanly instead of throwing.
+export const isTauri = (): boolean => {
+  if (typeof window === "undefined") return false;
+  return "__TAURI_INTERNALS__" in window;
 };
 
 export class TauriService {

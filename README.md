@@ -86,6 +86,16 @@ Grab the bundle for your platform from the [Releases page](https://github.com/mi
 
 Releases are **signed**, and the built-in **auto-updater** keeps the app current — ZanPlayer Lite checks GitHub Releases on launch and installs updates in-app.
 
+### Web App (PWA)
+
+The frontend is also a Progressive Web App. A hosted build can be **installed** from Chrome/Edge (Android or desktop) via the in-app *Install app* button or the browser's install affordance, and on iOS/iPadOS via **Add to Home Screen**.
+
+- **Playback is HTML5.** The web build has no native engine — it uses `<video>` and whatever codecs the host browser supports. It never claims (nor attempts) mpv, Media3 or AVFoundation playback.
+- **Offline app shell.** A service worker (`public/sw.js`) caches the app shell in production web builds so the installed app opens without a connection; media is streamed, never cached.
+- **No local AI on the web.** Whisper transcription needs the bundled desktop app (native whisper.cpp + bundled FFmpeg sidecar). On the web, transcription and model downloads are hidden by the Tauri-only gates, and all persistent state lives in browser `localStorage` (subject to browser storage limits). Media selected via the browser `<input>` or drag-and-drop stays in memory/`blob:` URLs — the app never requests filesystem permission.
+- Service worker registration is limited to production web builds (`import.meta.env.PROD && !isTauri()`); the Tauri webview never registers.
+- Safari does not fire `beforeinstallprompt`, so iOS/iPadOS installation is the manual Share → **Add to Home Screen** flow. Installed standalone windows are safe-area aware on iOS (notch/home-bar insets).
+
 ### Build from Source
 
 #### Prerequisites
@@ -93,7 +103,7 @@ Releases are **signed**, and the built-in **auto-updater** keeps the app current
 2. **Rust** (stable toolchain)
 3. Platform dependencies:
    - **macOS**: Xcode Command Line Tools
-   - **Linux**: `libwebkit2gtk-4.1-dev`, `build-essential`, `libssl-dev`, `libxdo-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, etc. (see `.github/workflows/build.yml`)
+   - **Linux**: `libwebkit2gtk-4.1-dev`, `build-essential`, `libssl-dev`, `libxdo-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, etc. (see `.github/workflows/release.yml`)
    - **Windows**: MSVC build tools
 
 #### Steps
@@ -110,6 +120,29 @@ npm run build         # type-check (tsc) + frontend build (vite)
 npm run tauri build   # full desktop bundles (app, dmg, AppImage, deb, msi)
 npm run release -- patch   # semantic-version release pipeline (see RELEASE_PROCESS.md)
 ```
+
+#### Mobile builds (Android / iOS)
+
+Mobile support is **unverified work in progress** — the Rust bridge and the
+plugin sources exist (`src-tauri/mobile/`), but neither platform has been built
+or run on a device. Prerequisites per platform:
+
+- **Android**: JDK 17+, Android SDK + NDK, and the `aarch64-linux-android` (and
+  `armv7-linux-androideabi`, `i686-linux-android`, `x86_64-linux-android`) Rust
+  targets. `npx tauri android init` scaffolds `src-tauri/gen/android`; then copy
+  `src-tauri/mobile/android/MediaPlaybackPlugin.kt` into the generated project
+  (exact paths in `src-tauri/mobile/android/README.md`). Requires `minSdkVersion
+  ≥ 24` (already set in `tauri.conf.json`).
+- **iOS/iPadOS**: Xcode (tested against Xcode's iOS SDK), the Rust targets
+  `aarch64-apple-ios` and `aarch64-apple-ios-sim`, and CocoaPods for the Tauri
+  iOS harness. `npx tauri ios init` scaffolds `src-tauri/gen/apple`; then
+  integrate `src-tauri/mobile/apple/MediaPlaybackPlugin.swift` per
+  `src-tauri/mobile/apple/README.md`. Requires iOS ≥ 15.0 (set in
+  `tauri.conf.json`).
+
+Neither mobile plugin has been compiled on a real machine yet — expect
+device-time fixes. See the two `src-tauri/mobile/*/README.md` files for the
+full integration and verification checklists.
 
 ## Offline AI — Where Things Live
 
@@ -130,11 +163,13 @@ ZanPlayer Lite/
 │   ├── services/
 │   │   ├── tauri.ts            # Typed wrappers for Rust commands
 │   │   └── store.ts            # Zustand store (persisted state)
+│   ├── hooks/useInstallPrompt.ts # deferred PWA install prompt (Chrome/Edge)
+│   ├── common/mediaFormats.ts  # Centralized media/subtitle format catalog
 │   ├── types/subtitle.ts       # Subtitle / cue / track types
 │   └── utils/                  # cn, subtitleExporter
 ├── scripts/
 │   └── release.mjs             # SemVer release automation
-├── public/                     # Static assets
+├── public/                     # Static assets (favicon, icons, manifest.json, sw.js PWA shell)
 ├── src-tauri/                  # Backend (Rust/Tauri)
 │   ├── src/main.rs             # Commands: whisper dual-pass jobs, live seek control, ffmpeg, subtitles, model downloads
 │   ├── src/pipeline.rs         # Silero VAD -> chunked Whisper decode (translate on/off) -> PTS sync + seek reset
@@ -142,7 +177,7 @@ ZanPlayer Lite/
 │   ├── mobile/                 # Native mobile plugin sources (Android Media3 / iOS AVPlayer) + READMEs
 │   ├── Cargo.toml / tauri.conf.json
 │   └── capabilities/main.json  # Tauri 2 permissions
-└── .github/workflows/build.yml # CI: builds + creates releases for all 4 platforms
+└── .github/workflows/            # CI: test.yml (quality gates) + release.yml (tag-triggered release builds)
 ```
 
 ## Native Playback Backends
@@ -163,6 +198,14 @@ Every backend emits the same 250 ms coalesced `mpv-timeupdate` payload, routes
 seeks through one native funnel, and signals `mpv-embed-lost` to drop back to
 HTML5 when the surface is lost. Shipped desktop builds are feature-off (HTML5);
 see `AGENTS.md` for the engine notes.
+
+**Codec support is per-backend and, outside the HTML5 path, unverified.** The
+file picker, drag-and-drop, native backends and HTML5 fallback all share one
+centralized format catalog (`src/common/mediaFormats.ts`), but which of those
+formats actually *decodes* depends on the underlying engine (browser codecs,
+libmpv builds, Media3, AVFoundation). No test media has yet been run through
+the native engines on any device — do not assume universal codec support until
+the compatibility matrix in `Todo.md` is filled in per platform.
 
 ### Mobile status (honest)
 

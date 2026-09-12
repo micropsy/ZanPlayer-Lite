@@ -10,6 +10,16 @@
   #root {
     background: transparent;
   }
+
+  /* Standalone PWA install (Add to Home Screen) renders in a standalone window
+     on iOS/iPadOS where the notch and home bar can occlude floating UI.
+     Only the media player's root gets safe-area padding — other screens live
+     inside the browser chrome where the system provides its own insets. */
+  @media (display-mode: standalone) {
+    .pwa-safe-top {
+      top: calc(max(1rem, env(safe-area-inset-top)));
+    }
+  }
 }
 
 @theme {

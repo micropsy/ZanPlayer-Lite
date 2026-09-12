@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 
@@ -13,7 +13,37 @@ vi.mock("@tauri-apps/api/path", () => ({
   homeDir: vi.fn().mockResolvedValue("/home"),
 }));
 
-import { TauriService } from "./tauri";
+import { TauriService, isTauri } from "./tauri";
+
+describe("isTauri environment detection", () => {
+  const original = Object.getOwnPropertyDescriptor(window, "__TAURI_INTERNALS__");
+
+  afterAll(() => {
+    if (original) {
+      Object.defineProperty(window, "__TAURI_INTERNALS__", original);
+    } else {
+      delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    }
+  });
+
+  it("returns true when the Tauri webview injected __TAURI_INTERNALS__", () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    expect(isTauri()).toBe(true);
+  });
+
+  it("returns false in a plain browser without the injected internals", () => {
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    expect(isTauri()).toBe(false);
+    // The test-suite default (Tauri-like shell) is restored for later suites.
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+  });
+});
 
 describe("TauriService dual-pass wiring", () => {
   beforeEach(() => {

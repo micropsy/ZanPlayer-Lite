@@ -1,0 +1,24 @@
+{
+  "name": "ZanPlayer Lite",
+  "short_name": "ZanPlayer",
+  "description": "Local-first video player with on-device AI subtitle generation. Web builds use HTML5 playback and browser codec support; native playback engines exist only in the installed desktop (mpv) and mobile (Media3/AVFoundation) apps.",
+  "start_url": ".",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "background_color": "#0a0d14",
+  "theme_color": "#0a0d14",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

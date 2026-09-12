@@ -20,7 +20,12 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "../utils/cn";
-import { TauriService, isTauri, type TranscriptionBatchDonePayload } from "../services/tauri";
+import {
+  TauriService,
+  isTauri,
+  type MpvTimeUpdatePayload,
+  type TranscriptionBatchDonePayload,
+} from "../services/tauri";
 import type { SubtitleCue } from "../types/subtitle";
 
 // Spoken-audio languages shown in the CC menu. The selection pins whisper's
@@ -66,11 +71,23 @@ const SPEED_RATES = [0.5, 1, 1.25, 1.5, 2] as const;
 
 export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const nativeStageRef = useRef<HTMLDivElement | null>(null);
   const [showControls, setShowControls] = useState(true);
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [videoSource, setVideoSource] = useState<string | null>(null);
+  // Playback engine. `mpv` uses the native libmpv surface embedded behind the
+  // transparent webview stage; `html5` falls back to the <video> element; null
+  // while engine detection is in flight.
+  const [engine, setEngine] = useState<"html5" | "mpv" | null>(null);
+  // Mirror of the native clock (driven by `mpv-timeupdate` events).
+  const [mpvClock, setMpvClock] = useState({ position: 0, duration: 0 });
+  const nativeLoadedRef = useRef(false);
+  const resumeAppliedRef = useRef(false);
+  const engineRef = useRef<"html5" | "mpv" | null>(null);
+  engineRef.current = engine;
+  const recordPlaybackRef = useRef<() => void>(() => {});
   const [showCCMenu, setShowCCMenu] = useState(false);
   const [ccMenuView, setCcMenuView] = useState<"root" | "source" | "output" | "genmode">("root");
   const [showQuickSettings, setShowQuickSettings] = useState(false);
@@ -111,9 +128,15 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     upsertRecentFile,
     touchRecentFile,
     removeRecentFile,
+    theme,
     resumeAt,
     setResumeAt,
   } = useAppStore();
+
+  // Latest playback prefs, readable from inside async native event handlers
+  // without re-registering the listeners on every change.
+  const prefsRef = useRef({ volume, isMuted, playbackRate });
+  prefsRef.current = { volume, isMuted, playbackRate };
 
   const controlsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingPlayRef = useRef(false);
@@ -143,6 +166,17 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const trackForId = (id: string | null) =>
     subtitleTracks.find((t) => t.id === id) ?? null;
 
+  // The active clock and duration come from the native mpv mirror when the
+  // engine is mpv (there is no <video> element to read), otherwise fall back
+  // to the media element.
+  const isNative = engine === "mpv";
+  const currentClock = isNative
+    ? mpvClock.position
+    : (videoRef.current?.currentTime ?? 0);
+  const durationClock = isNative
+    ? mpvClock.duration
+    : (videoRef.current?.duration ?? 0);
+
   // Dual-subtitle mode uses both generated tracks; single mode uses the active track.
   const originalGeneratedTrack = trackForId(originalStreamTrackIdRef.current);
   const translationGeneratedTrack = trackForId(translationStreamTrackIdRef.current);
@@ -153,6 +187,15 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const activeTrack = inDualMode ? null : trackForId(activeSubtitleTrackId);
 
   const togglePlay = () => {
+    if (isNative) {
+      if (isPlaying) {
+        void TauriService.mpvPause().catch(() => setIsPlaying(true));
+      } else {
+        void TauriService.mpvPlay().catch(() => setIsPlaying(false));
+      }
+      setIsPlaying(!isPlaying);
+      return;
+    }
     if (videoRef.current) {
       if (isPlaying) {
         videoRef.current.pause();
@@ -183,6 +226,9 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     lastRecentSaveRef.current = now;
     touchRecentFile(s.currentVideoPath, s.currentTime);
   }, [touchRecentFile]);
+
+  // Keep the persisted-playhead helper reachable from the mpv event handlers.
+  recordPlaybackRef.current = maybeRecordPlayback;
 
   const clearPendingSeek = () => {
     pendingSeekRef.current = false;
@@ -217,6 +263,26 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const notifyPipelineSeekRef = useRef<(target: number) => void>(() => {});
   notifyPipelineSeekRef.current = notifyPipelineSeek;
 
+  // Single funnel for every native (mpv) seek. Ordering is the contract:
+  //   1. clear any pending HTML5 seek guard,
+  //   2. move the optimistic store clock,
+  //   3. notify the streaming pipeline FIRST so its passes drop VAD state and
+  //      reposition the WAV reader *before* mpv moves (no pre-seek cue race),
+  //   4. then issue the mpv seek. The coalesced backend tick reconciles the
+  //      exact position, so the UI clock never drifts from mpv's PTS.
+  const seekNative = (target: number) => {
+    clearPendingSeek();
+    const clamped = Math.max(
+      0,
+      durationClock > 0 ? Math.min(target, durationClock) : target
+    );
+    setCurrentTime(clamped);
+    notifyPipelineSeekRef.current(clamped);
+    void TauriService.mpvSeek(clamped).catch(() => {});
+  };
+  const seekNativeRef = useRef<(target: number) => void>(() => {});
+  seekNativeRef.current = seekNative;
+
   const handleMouseMove = () => {
     setShowControls(true);
     if (controlsTimeoutRef.current) {
@@ -231,6 +297,12 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   };
 
   const toggleMute = () => {
+    if (isNative) {
+      const newMuted = !isMuted;
+      setIsMuted(newMuted);
+      void TauriService.mpvSetVolume(newMuted ? 0 : volume * 100).catch(() => {});
+      return;
+    }
     if (videoRef.current) {
       const newMuted = !isMuted;
       videoRef.current.muted = newMuted;
@@ -241,6 +313,11 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newVolume = parseFloat(e.target.value);
     setVolume(newVolume);
+    if (isNative) {
+      setIsMuted(newVolume === 0);
+      void TauriService.mpvSetVolume(newVolume * 100).catch(() => {});
+      return;
+    }
     if (videoRef.current) {
       videoRef.current.volume = newVolume;
       setIsMuted(newVolume === 0);
@@ -248,6 +325,10 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (isNative) {
+      seekNativeRef.current(parseFloat(e.target.value));
+      return;
+    }
     if (videoRef.current) {
       clearPendingSeek();
       const newTime = parseFloat(e.target.value);
@@ -258,6 +339,10 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   };
 
   const skipForward = (seconds: number) => {
+    if (isNative) {
+      seekNativeRef.current(currentClock + seconds);
+      return;
+    }
     if (videoRef.current) {
       clearPendingSeek();
       const next = Math.min(
@@ -271,6 +356,10 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   };
 
   const skipBackward = (seconds: number) => {
+    if (isNative) {
+      seekNativeRef.current(currentClock - seconds);
+      return;
+    }
     if (videoRef.current) {
       clearPendingSeek();
       const next = Math.max(0, videoRef.current.currentTime - seconds);
@@ -309,7 +398,12 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
           skipForward(5);
           break;
         case "ArrowUp":
-          if (videoRef.current) {
+          if (isNative) {
+            const newVolume = Math.min(1, volume + 0.1);
+            setVolume(newVolume);
+            if (newVolume > 0) setIsMuted(false);
+            void TauriService.mpvSetVolume(newVolume * 100).catch(() => {});
+          } else if (videoRef.current) {
             const newVolume = Math.min(1, videoRef.current.volume + 0.1);
             videoRef.current.volume = newVolume;
             setVolume(newVolume);
@@ -317,7 +411,12 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
           }
           break;
         case "ArrowDown":
-          if (videoRef.current) {
+          if (isNative) {
+            const newVolume = Math.max(0, volume - 0.1);
+            setVolume(newVolume);
+            if (newVolume === 0) setIsMuted(true);
+            void TauriService.mpvSetVolume(newVolume * 100).catch(() => {});
+          } else if (videoRef.current) {
             const newVolume = Math.max(0, videoRef.current.volume - 0.1);
             videoRef.current.volume = newVolume;
             setVolume(newVolume);
@@ -335,7 +434,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isPlaying, isMuted]);
+  }, [isPlaying, isMuted, volume]);
 
   // Handle fullscreen change
   useEffect(() => {
@@ -372,15 +471,19 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   // media engine confirms the new position via `seeked` (or a 500 ms fallback).
   useEffect(() => {
     if (seekTo === null) return;
+    const target = seekTo;
+    setSeekTo(null);
+    if (isNative) {
+      // Native engine: funnel the seek through seekNative so the pipeline
+      // flushes first and `mpv-timeupdate` reconciles from the backend tick.
+      seekNativeRef.current(target);
+      return;
+    }
     clearPendingSeek();
     const video = videoRef.current;
     if (!video) {
-      // No media element yet: drop the stale request instead of firing it late.
-      setSeekTo(null);
       return;
     }
-    const target = seekTo;
-    setSeekTo(null);
     if (Math.abs(video.currentTime - target) < 0.05) {
       // Already on that position — just sync the clock, no seek to complete.
       setCurrentTime(target);
@@ -397,7 +500,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
         setCurrentTime(videoRef.current.currentTime);
       }
     }, 500);
-  }, [seekTo, setSeekTo, setCurrentTime]);
+  }, [seekTo, setSeekTo, setCurrentTime, isNative]);
 
   // Cancel a pending seek on unmount so its fallback timer never fires late.
   useEffect(
@@ -422,10 +525,25 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   // future load.
   useEffect(() => {
     if (resumeAt === null) return;
-    const video = videoRef.current;
-    if (!video || !videoSource) return;
     const target = resumeAt;
     setResumeAt(null);
+    if (isNative) {
+      // Park the target; it is applied on the first native clock tick once the
+      // file is loaded (or by the `mpv-loaded` handler if that wins the race).
+      pendingResumeRef.current = target;
+      if (nativeLoadedRef.current) {
+        seekNativeRef.current(target);
+      }
+      return;
+    }
+    const video = videoRef.current;
+    if (!video || !videoSource) {
+      // Media not ready (or the engine hasn't been decided yet — native
+      // detection is async): park the target and let whichever engine wins
+      // apply it once the file actually loads.
+      pendingResumeRef.current = target;
+      return;
+    }
     if (video.readyState >= 1) {
       const clamped = Math.max(0, Math.min(video.duration || target, target));
       video.currentTime = clamped;
@@ -434,14 +552,16 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     } else {
       pendingResumeRef.current = target;
     }
-  }, [resumeAt, videoSource, setResumeAt, setCurrentTime]);
+  }, [resumeAt, videoSource, setResumeAt, setCurrentTime, isNative]);
 
   // Apply playback speed to any freshly loaded video and re-apply when the
-  // user picks a new rate while a video is already running.
+  // user picks a new rate while a video is already running. Native playback
+  // is driven by `mpv_set_speed` instead (see `applyPlaybackRate`).
   useEffect(() => {
+    if (isNative) return;
     if (!videoSource || !videoRef.current) return;
     videoRef.current.playbackRate = playbackRate;
-  }, [playbackRate, videoSource]);
+  }, [playbackRate, videoSource, isNative]);
 
   // Upsert a recent-history entry each time a new path is loaded so the home
   // screen always lists it. Existing `lastPlayedTimestamp` values are preserved;
@@ -486,11 +606,10 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     [...list].sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime);
 
   const getCurrentCue = (track: typeof activeTrack) => {
-    if (!track || !videoRef.current) return null;
+    if (!track) return null;
+    if (!isNative && !videoRef.current) return null;
     return track.cues.find(
-      (cue) =>
-        videoRef.current!.currentTime >= cue.startTime &&
-        videoRef.current!.currentTime <= cue.endTime
+      (cue) => currentClock >= cue.startTime && currentClock <= cue.endTime
     );
   };
 
@@ -584,7 +703,11 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
       if (!realtimeStartedRef.current) {
         realtimeStartedRef.current = true;
         if (!s.isPlaying) {
-          videoRef.current?.play().catch(() => setIsPlaying(false));
+          if (engineRef.current === "mpv") {
+            void TauriService.mpvPlay().catch(() => setIsPlaying(false));
+          } else {
+            videoRef.current?.play().catch(() => setIsPlaying(false));
+          }
         }
       }
     } catch (err) {
@@ -680,7 +803,11 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
             if (!realtimeStartedRef.current) {
               realtimeStartedRef.current = true;
               if (!s.isPlaying) {
-                videoRef.current?.play().catch(() => setIsPlaying(false));
+                if (engineRef.current === "mpv") {
+                  void TauriService.mpvPlay().catch(() => setIsPlaying(false));
+                } else {
+                  videoRef.current?.play().catch(() => setIsPlaying(false));
+                }
               }
             }
             setTranscriptionProgress(100);
@@ -714,6 +841,133 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     };
   }, [setTranscriptionProgress, setIsTranscribing, flushQueuedCues]);
 
+  // Native mpv engine: mirror its playback clock into the store (there is no
+  // <video> element firing `timeupdate`), and apply resume / volume / speed on
+  // the first observed tick so it never races the backend's `mpv-loaded` event.
+  useEffect(() => {
+    if (!isTauri() || engine !== "mpv") return;
+    let disposed = false;
+    let unlistenTime: (() => void) | null = null;
+    let unlistenLoaded: (() => void) | null = null;
+
+    const applyNativePrefsAndResume = () => {
+      if (resumeAppliedRef.current) return;
+      resumeAppliedRef.current = true;
+      const prefs = prefsRef.current;
+      void TauriService.mpvSetVolume(prefs.isMuted ? 0 : prefs.volume * 100).catch(() => {});
+      void TauriService.mpvSetSpeed(prefs.playbackRate).catch(() => {});
+      const resume = pendingResumeRef.current;
+      if (resume != null) {
+        pendingResumeRef.current = null;
+        // Go through the unified funnel: pipeline flush → mpv seek.
+        seekNativeRef.current(resume);
+      }
+    };
+
+    void (async () => {
+      unlistenTime = await listen<MpvTimeUpdatePayload>("mpv-timeupdate", (event) => {
+        if (disposed) return;
+        const { position = 0, duration = 0, paused = false, ended = false } =
+          event.payload ?? {};
+        const clamped = Math.max(0, position);
+        setMpvClock({ position: clamped, duration: Math.max(0, duration) });
+        setCurrentTime(clamped);
+        if (ended) {
+          setIsPlaying(false);
+        } else {
+          setIsPlaying(!paused);
+        }
+        recordPlaybackRef.current();
+        if (duration > 0) applyNativePrefsAndResume();
+      });
+      unlistenLoaded = await listen("mpv-loaded", () => {
+        if (disposed) return;
+        nativeLoadedRef.current = true;
+        applyNativePrefsAndResume();
+      });
+    })();
+
+    return () => {
+      disposed = true;
+      unlistenTime?.();
+      unlistenLoaded?.();
+      void TauriService.mpvStop().catch(() => {});
+    };
+    // Registers/unregisters only when the engine actually switches to mpv.
+  }, [engine]);
+
+  // Keep the embedded mpv surface glued to the DOM video stage: any layout
+  // change (window resize, sidebar/toolbar reflow, fullscreen toggle) is
+  // re-anchored through `mpv_set_layout`. A rAF chip beats ResizeObserver here
+  // because it also catches *moves* (rect shifts without a size change), and
+  // IPC is coalesced to whole CSS pixels so it never spams the backend.
+  useEffect(() => {
+    if (!isTauri() || engine !== "mpv") return;
+    const stage = nativeStageRef.current;
+    if (!stage) return;
+    let disposed = false;
+    let lastKey = "";
+    const report = () => {
+      if (disposed) return;
+      const r = stage.getBoundingClientRect();
+      const key = `${Math.round(r.x)}:${Math.round(r.y)}:${Math.round(r.width)}:${Math.round(
+        r.height
+      )}`;
+      if (key === lastKey) return;
+      lastKey = key;
+      void TauriService.mpvSetLayout({ x: r.x, y: r.y, width: r.width, height: r.height }).catch(
+        () => {}
+      );
+    };
+    report();
+    if (typeof requestAnimationFrame !== "function") return;
+    let raf = 0;
+    const loop = () => {
+      if (disposed) return;
+      report();
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => {
+      disposed = true;
+      cancelAnimationFrame(raf);
+    };
+  }, [engine]);
+
+  // Cutover guard: if mpv ever loses the embedded surface (the backend emits
+  // `mpv-embed-lost` the moment the wid stops resolving to our host surface),
+  // the rogue floating window must never masquerade as in-app playback — fall
+  // straight back to HTML5 so the user keeps a working, embedded picture.
+  useEffect(() => {
+    if (!isTauri() || engine !== "mpv") return;
+    let disposed = false;
+    let unlistenEmbedLost: (() => void) | null = null;
+    void (async () => {
+      unlistenEmbedLost = await listen("mpv-embed-lost", () => {
+        if (disposed) return;
+        console.error("Native mpv surface lost — falling back to HTML5");
+        nativeLoadedRef.current = false;
+        resumeAppliedRef.current = false;
+        setEngine("html5");
+        const path = currentVideoPath;
+        if (path) {
+          TauriService.getVideoBlobUrl(path)
+            .then((blobUrl) => {
+              if (!disposed) setVideoSource(blobUrl);
+            })
+            .catch((err) => {
+              if (!disposed) setVideoSource(null);
+              console.error("HTML5 fallback blob load failed:", err);
+            });
+        }
+      });
+    })();
+    return () => {
+      disposed = true;
+      unlistenEmbedLost?.();
+    };
+  }, [engine, currentVideoPath]);
+
   const handleToggleSubtitles = () => {
     const turningOn = !showSubtitles;
     setShowSubtitles(turningOn);
@@ -722,39 +976,65 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     }
   };
 
-  // Handle video source management
+  // Handle video source management & engine selection. A browser-supplied
+  // URL always uses the HTML5 engine; a filesystem path (Tauri) prefers the
+  // native mpv surface and falls back to an HTML5 blob URL on any failure.
+  // When both a URL and a path are present (recent-history / library clicks),
+  // the path wins so native playback is not bypassed by a pre-fetched blob.
   useEffect(() => {
-    if (currentVideoUrl) {
+    if (currentVideoUrl && !currentVideoPath) {
+      setEngine("html5");
       setVideoSource(currentVideoUrl);
     }
-  }, [currentVideoUrl]);
+  }, [currentVideoUrl, currentVideoPath]);
 
   useEffect(() => {
     if (currentVideoPath && isTauri()) {
-      // If we have a video path in Tauri environment, convert it to a blob URL
       let isMounted = true;
       setVideoSource(null);
-
-      const loadVideo = async () => {
+      // A new file landed while the native engine was active: the listener
+      // effect does not re-register (same `engine`), so flag it to re-apply
+      // volume/speed and any parked resume on the next observed tick.
+      nativeLoadedRef.current = false;
+      resumeAppliedRef.current = false;
+      void (async () => {
+        let useNative = false;
         try {
-          const blobUrl = await TauriService.getVideoBlobUrl(currentVideoPath);
-          if (isMounted) {
-            setVideoSource(blobUrl);
+          useNative = await TauriService.isNativePlayerAvailable();
+        } catch (err) {
+          console.error("Native player availability check failed:", err);
+        }
+        if (!isMounted) return;
+        if (useNative) {
+          setEngine("mpv");
+          try {
+            await TauriService.mpvLoad(currentVideoPath);
+          } catch (err) {
+            console.error("Native playback failed; falling back to HTML5:", err);
+            if (!isMounted) return;
+            setEngine("html5");
+            try {
+              const blobUrl = await TauriService.getVideoBlobUrl(currentVideoPath);
+              if (isMounted) setVideoSource(blobUrl);
+            } catch (error) {
+              console.error("Failed to load video from path:", error);
+            }
           }
-        } catch (error) {
-          console.error("Failed to load video from path:", error);
-          if (isMounted) {
-            setVideoSource(null);
+        } else {
+          setEngine("html5");
+          try {
+            const blobUrl = await TauriService.getVideoBlobUrl(currentVideoPath);
+            if (isMounted) setVideoSource(blobUrl);
+          } catch (error) {
+            console.error("Failed to load video from path:", error);
           }
         }
-      };
-
-      loadVideo();
-
+      })();
       return () => {
         isMounted = false;
       };
     } else if (!currentVideoPath && !currentVideoUrl) {
+      setEngine(null);
       setVideoSource(null);
     }
   }, [currentVideoPath, currentVideoUrl]);
@@ -793,23 +1073,18 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   };
 
   // Open a previously-watched video from the home-screen recent list. The
-  // video is loaded through the same blob-URL path as drag/drop, then a
-  // one-shot `resumeAt` field is dispatched so the player seeks to the saved
-  // playhead position once `loadedmetadata` fires.
-  const openRecentFile = async (filePath: string, timestamp: number) => {
+  // file is loaded through the regular engine pipeline (native mpv, or the
+  // HTML5 blob-URL fallback) purely by setting the path; a one-shot `resumeAt`
+  // field is then dispatched so the player seeks to the saved playhead once
+  // the media actually loads.
+  const openRecentFile = (filePath: string, timestamp: number) => {
     if (!isTauri()) return;
-    try {
-      const url = await TauriService.getVideoBlobUrl(filePath);
-      resetSubtitles();
-      setCurrentVideo(null);
-      setCurrentVideoUrl(url);
-      setCurrentVideoPath(filePath);
-      setResumeAt(timestamp);
-      emit("zanplayer-lite:video-dropped");
-    } catch (err) {
-      console.error("Failed to resume video:", err);
-      removeRecentFile(filePath);
-    }
+    resetSubtitles();
+    setCurrentVideo(null);
+    setCurrentVideoUrl(null);
+    setCurrentVideoPath(filePath);
+    setResumeAt(timestamp);
+    emit("zanplayer-lite:video-dropped");
   };
 
   // Quick-settings / speed popovers – mutually exclusive with the CC menu.
@@ -833,7 +1108,11 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
 
   const applyPlaybackRate = (rate: number) => {
     setPlaybackRate(rate);
-    if (videoRef.current) videoRef.current.playbackRate = rate;
+    if (isNative) {
+      void TauriService.mpvSetSpeed(rate).catch(() => {});
+    } else if (videoRef.current) {
+      videoRef.current.playbackRate = rate;
+    }
     setShowSpeedMenu(false);
   };
 
@@ -850,7 +1129,12 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
 
   return (
     <div
-      className="relative w-full h-full bg-black group"
+      className={cn(
+        "relative w-full h-full group",
+        // Native mpv draws behind the transparent webview stage, so the player
+        // root must stay transparent; HTML5 keeps an opaque letterbox.
+        isNative ? "" : "bg-black"
+      )}
       onMouseMove={handleMouseMove}
       onMouseLeave={() => isPlaying && setShowControls(false)}
       onDragOver={(e) => {
@@ -858,12 +1142,26 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
         e.dataTransfer.dropEffect = "copy";
       }}
     >
-      {videoSource ? (
+      {isNative || videoSource ? (
         <>
+          {isNative ? (
+            <div
+              ref={nativeStageRef}
+              className="relative z-0 w-full h-full"
+              role="group"
+              aria-label="Native video surface"
+              data-native-stage
+            >
+              {/* Clear placeholder for the native stage: mpv renders its video
+                  view INTO this region, below the transparent webview layer.
+                  The root stays transparent (no background class) so the
+                  decoded frames show through behind the DOM overlay stack. */}
+            </div>
+          ) : (
           <video
             ref={videoRef}
-            src={videoSource}
-            className="w-full h-full object-contain"
+            src={videoSource ?? undefined}
+            className="relative z-0 w-full h-full object-contain"
             onTimeUpdate={handleTimeUpdate}
             onSeeked={handleSeeked}
             onPlay={() => setIsPlaying(true)}
@@ -893,10 +1191,11 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
                 }
               }
             }}
-          />
+          ></video>
+          )}
 
           {/* Audio-only visualizer placeholder */}
-          {videoRef.current && videoRef.current.videoWidth === 0 && videoRef.current.videoHeight === 0 && (
+          {!isNative && videoRef.current && videoRef.current.videoWidth === 0 && videoRef.current.videoHeight === 0 && (
             <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-zan-deep to-zan-black">
               <div className="flex flex-col items-center gap-6">
                 <div className="w-32 h-32 bg-gradient-to-br from-zan-blue to-zan-deep rounded-3xl shadow-2xl flex items-center justify-center">
@@ -922,11 +1221,13 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
             </div>
           )}
 
-          {/* Subtitle Overlay */}
+          {/* Subtitle Overlay — explicit high z-index (z-30): the dual-pass
+              container must always sit above the video surface and the
+              play/pause overlay, below the controls bar. */}
           {showSubtitles && (currentCue || originalCue || translationCue) && (
             <div
               className={cn(
-                "absolute left-0 right-0 flex flex-col items-center px-4 pointer-events-none",
+                "absolute left-0 right-0 flex flex-col items-center px-4 pointer-events-none z-30",
                 subtitleStyle.alignment === "bottom" ? "bottom-24" : "top-24"
               )}
             >
@@ -987,9 +1288,9 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
             </div>
           )}
 
-          {/* Play/Pause Overlay */}
+          {/* Play/Pause Overlay — above the video surface, below subtitles. */}
           <div
-            className="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity"
+            className="absolute inset-0 z-20 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity"
             onClick={togglePlay}
           >
             {!isPlaying && (
@@ -1010,10 +1311,10 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
             </div>
           )}
 
-          {/* Controls Bar */}
+          {/* Controls Bar — top overlay layer for all DOM chrome. */}
           <div
             className={cn(
-              "absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-6 py-4 transition-opacity duration-300",
+              "absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-6 py-4 transition-opacity duration-300 z-40",
               showControls ? "opacity-100" : "opacity-0"
             )}
           >
@@ -1022,14 +1323,14 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
               <input
                 type="range"
                 min="0"
-                max={videoRef.current?.duration || 100}
-                value={videoRef.current?.currentTime || 0}
+                max={durationClock || 100}
+                value={currentClock}
                 onChange={handleSeek}
                 className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-zan-cyan"
               />
               <div className="flex justify-between text-xs text-gray-300 mt-1">
-                <span>{formatTime(videoRef.current?.currentTime || 0)}</span>
-                <span>{formatTime(videoRef.current?.duration || 0)}</span>
+                <span>{formatTime(currentClock)}</span>
+                <span>{formatTime(durationClock)}</span>
               </div>
             </div>
 
@@ -1093,7 +1394,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
                   </button>
 
                   {showSpeedMenu && (
-                    <div className="absolute bottom-full right-0 mb-3 bg-zan-black/95 backdrop-blur rounded-xl shadow-2xl border border-gray-700 min-w-[130px] overflow-hidden">
+                    <div className="absolute bottom-full right-0 mb-3 z-30 bg-zan-black/95 backdrop-blur rounded-xl shadow-2xl border border-gray-700 min-w-[130px] overflow-hidden">
                       {SPEED_RATES.map((rate) => (
                         <button
                           key={rate}
@@ -1136,7 +1437,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
                   </button>
 
                   {showCCMenu && (
-                    <div className="absolute bottom-full right-0 mb-3 bg-zan-black/95 backdrop-blur rounded-xl shadow-2xl border border-gray-700 min-w-[220px] overflow-hidden">
+                    <div className="absolute bottom-full right-0 mb-3 z-30 bg-zan-black/95 backdrop-blur rounded-xl shadow-2xl border border-gray-700 min-w-[220px] overflow-hidden">
                       {ccMenuView === "source" ? (
                         <>
                           <div className="flex items-center px-2 py-2 border-b border-gray-700">
@@ -1342,7 +1643,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
                   </button>
 
                   {showQuickSettings && (
-                    <div className="absolute bottom-28 right-0 z-30 w-72 bg-zan-black/95 backdrop-blur rounded-xl shadow-2xl border border-gray-700 p-4">
+                    <div className="absolute bottom-28 right-0 z-50 w-72 bg-zan-black/95 backdrop-blur rounded-xl shadow-2xl border border-gray-700 p-4">
                       <h3 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
                         <Settings2 className="w-4 h-4" />
                         Quick Settings
@@ -1451,7 +1752,10 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
           </div>
         </>
       ) : (
-        <div className="flex flex-col items-center justify-center w-full h-full text-gray-500 overflow-y-auto px-6 py-8">
+        <div className={cn(
+          "flex flex-col items-center justify-center w-full h-full text-gray-500 overflow-y-auto px-6 py-8",
+          theme === "dark" ? "bg-zan-black" : "bg-gray-50"
+        )}>
           <FileVideo className="w-16 h-16 mb-4 opacity-50" />
           <p className="text-lg">Select a video or audio file to start</p>
           <div className="mt-6 text-sm text-gray-600 max-w-md text-center">

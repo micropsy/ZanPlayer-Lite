@@ -8,22 +8,7 @@ import { listen, emit } from '@tauri-apps/api/event';
 import { TauriService, isTauri } from './services/tauri';
 import { checkForUpdates } from './services/updater';
 import { UpdateModal } from './components/UpdateModal';
-
-// Helper functions to check file types
-const isVideoFile = (fileName: string): boolean => {
-  const ext = fileName.toLowerCase().split('.').pop();
-  return ['mp4', 'mkv', 'mov', 'avi', 'wmv', 'flv', 'webm', 'm4v'].includes(ext || '');
-};
-
-const isAudioFile = (fileName: string): boolean => {
-  const ext = fileName.toLowerCase().split('.').pop();
-  return ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac', 'wma'].includes(ext || '');
-};
-
-const isSubtitleFile = (fileName: string): boolean => {
-  const ext = fileName.toLowerCase().split('.').pop();
-  return ['srt', 'vtt', 'ass', 'ssa'].includes(ext || '');
-};
+import { isVideoFile, isAudioFile, isSubtitleFile, isParsableSubtitleFile } from './common/mediaFormats';
 
 function App() {
   const theme = useAppStore(state => state.theme);
@@ -246,15 +231,15 @@ function App() {
         const url = URL.createObjectURL(file);
         setCurrentVideoUrl(url);
         setCurrentVideoPath(null);
-      } else if (file.name.endsWith('.srt') || file.name.endsWith('.vtt')) {
+      } else if (isParsableSubtitleFile(file.name)) {
         // Handle subtitle file
         const reader = new FileReader();
         reader.onload = (event) => {
           const text = event.target?.result as string;
           let cues: any[] = [];
-          if (file.name.endsWith('.srt')) {
+          if (file.name.toLowerCase().endsWith('.srt')) {
             cues = parseSRT(text);
-          } else if (file.name.endsWith('.vtt')) {
+          } else {
             cues = parseVTT(text);
           }
           if (cues.length > 0) {
@@ -277,7 +262,7 @@ function App() {
     <div 
       ref={containerRef}
       className={`flex w-screen h-screen overflow-hidden ${
-        theme === 'dark' ? 'bg-zan-black text-white' : 'bg-gray-50 text-gray-900'
+        theme === 'dark' ? 'text-white' : 'text-gray-900'
       }`}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
@@ -293,18 +278,27 @@ function App() {
         </div>
       )}
 
+      {sidebarVisible && (
+        <div
+          className="absolute inset-0 z-30 bg-black/45 backdrop-blur-[2px] md:hidden"
+          onClick={() => setSidebarVisible(false)}
+          aria-hidden="true"
+        />
+      )}
       {sidebarVisible && <Sidebar />}
-      <div className="flex-1 relative">
+      <div className="relative min-w-0 flex-1">
         {!sidebarVisible && (
           <button
             onClick={() => setSidebarVisible(true)}
-            className={`absolute top-4 left-4 z-40 p-2 rounded-lg ${
+            aria-label="Open sidebar"
+            title="Open sidebar"
+            className={`absolute top-4 left-4 z-40 flex h-10 w-10 items-center justify-center rounded-xl border transition-colors ${
               theme === 'dark'
-                ? 'bg-zan-black/80 hover:bg-zan-deep text-white'
-                : 'bg-white hover:bg-gray-100 text-gray-900'
-            } shadow-lg`}
+                ? 'border-white/10 bg-zan-black/90 text-white shadow-xl shadow-black/20 hover:bg-zan-deep'
+                : 'border-gray-200 bg-white/95 text-gray-900 shadow-xl shadow-gray-300/30 hover:bg-gray-100'
+            }`}
           >
-            <Menu className="w-6 h-6" />
+            <Menu className="h-5 w-5" />
           </button>
         )}
         <VideoPlayer onEditSubtitles={() => setEditorOpen(true)} />

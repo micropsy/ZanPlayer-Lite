@@ -9,12 +9,14 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "ZanPlayer Lite",
         "width": 1200,
         "height": 800,
-        "resizable": true
+        "resizable": true,
+        "transparent": true
       }
     ],
     "security": {
@@ -52,6 +54,12 @@
     ],
     "macOS": {
       "signingIdentity": "-"
+    },
+    "android": {
+      "minSdkVersion": 24
+    },
+    "ios": {
+      "minimumSystemVersion": "15.0"
     }
   }
 }

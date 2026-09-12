@@ -402,3 +402,206 @@ describe("VideoPlayer quality-of-life features", () => {
     expect(screen.queryByText("b.mp4")).toBeNull();
   });
 });
+
+describe("VideoPlayer native mpv engine", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    Object.keys(listeners).forEach((k) => delete listeners[k]);
+    invoke.mockReset();
+    emit.mockClear();
+    useAppStore.setState({
+      currentVideo: null,
+      currentVideoUrl: null,
+      currentVideoPath: "/tmp/media.wav",
+      subtitleTracks: [],
+      activeSubtitleTrackId: null,
+      showSubtitles: false,
+      currentTime: 0,
+      isPlaying: false,
+      isTranscribing: false,
+      transcriptionProgress: 0,
+      subtitleMode: "english",
+      transcriptionMode: "stream",
+      sourceLanguage: "auto",
+      seekTo: null,
+      resumeAt: null,
+      recentFiles: [],
+      playbackRate: 1,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("loads the path into libmpv and mirrors its clock into the store when the feature is compiled in", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+
+    // The transparent native stage replaces the <video> element...
+    await waitFor(() => expect(screen.getByLabelText("Native video surface")).toBeTruthy());
+    expect(document.querySelector("video")).toBeNull();
+
+    // ...and the backend receives the load request for the filesystem path.
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("mpv_load", { path: "/tmp/media.wav" })
+    );
+
+    // The first tick mirrors position/duration and the running state.
+    await act(async () => {
+      listeners["mpv-timeupdate"]!({
+        payload: { position: 12.5, duration: 100, paused: false, ended: false },
+      });
+    });
+    expect(useAppStore.getState().currentTime).toBe(12.5);
+    expect(useAppStore.getState().isPlaying).toBe(true);
+
+    // A paused / ended tick stops the UI clock (EOF with keep-open=yes).
+    await act(async () => {
+      listeners["mpv-timeupdate"]!({
+        payload: { position: 99, duration: 100, paused: true, ended: true },
+      });
+    });
+    expect(useAppStore.getState().isPlaying).toBe(false);
+
+    // Space drives libmpv play/pause instead of a media element.
+    fireEvent.keyDown(window, { code: "Space" });
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_play"));
+    fireEvent.keyDown(window, { code: "Space" });
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_pause"));
+  });
+
+  it("applies resume, volume, and speed when the native file first reports a duration", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      return undefined;
+    });
+    useAppStore.setState({ resumeAt: 90 });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(screen.getByLabelText("Native video surface")).toBeTruthy());
+
+    await act(async () => {
+      listeners["mpv-timeupdate"]!({
+        payload: { position: 0, duration: 100, paused: false, ended: false },
+      });
+    });
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_set_volume", { level: 100 }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_set_speed", { speed: 1 }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_seek", { position: 90 }));
+    expect(useAppStore.getState().resumeAt).toBeNull();
+    expect(useAppStore.getState().currentTime).toBe(90);
+  });
+
+  it("routes the playback-speed menu to mpv_set_speed in native mode", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(screen.getByLabelText("Native video surface")).toBeTruthy());
+
+    fireEvent.click(screen.getByTitle("Playback speed"));
+    fireEvent.click(screen.getByText("1.5x"));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_set_speed", { speed: 1.5 }));
+    expect(useAppStore.getState().playbackRate).toBe(1.5);
+  });
+
+  it("falls back to the HTML5 blob pipeline when libmpv rejects the load", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "mpv_load") throw new Error("libmpv unavailable");
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    expect(screen.queryByLabelText("Native video surface")).toBeNull();
+    const video = document.querySelector("video") as HTMLVideoElement;
+    expect(video.src).toContain("asset://");
+  });
+
+  it("uses HTML5 when the backend reports the native engine unavailable", async () => {
+    // Nothing to sniff in the frontend: `mpv_is_available` is the single source
+    // of truth for engine selection, so a feature-off desktop build or a mobile
+    // build with a failed plugin registration both land here without any UA or
+    // platform detection.
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return false;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    expect(screen.queryByLabelText("Native video surface")).toBeNull();
+    expect(invoke).toHaveBeenCalledWith("mpv_is_available");
+  });
+
+  it("prefers the native engine even under a mobile-style user agent (no UA sniffing)", async () => {
+    const original = navigator.userAgent;
+    try {
+      Object.defineProperty(navigator, "userAgent", {
+        configurable: true,
+        value:
+          "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+      });
+    } catch {
+      // jsdom may forbid redefinition in some versions; the assertion below is
+      // about the engine gate, not the UA value itself.
+    }
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(screen.getByLabelText("Native video surface")).toBeTruthy());
+    expect(document.querySelector("video")).toBeNull();
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_load", { path: "/tmp/media.wav" }));
+
+    if (navigator.userAgent !== original) {
+      Object.defineProperty(navigator, "userAgent", { configurable: true, value: original });
+    }
+  });
+
+  it("re-anchors the stage rect via mpv_set_layout and falls back to HTML5 when the embed is lost", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(screen.getByLabelText("Native video surface")).toBeTruthy());
+
+    // The surface is anchored once the stage mounts (rect coalesced to px).
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        rect: expect.objectContaining({
+          x: expect.any(Number),
+          y: expect.any(Number),
+          width: expect.any(Number),
+          height: expect.any(Number),
+        }),
+      })
+    );
+
+    // Backend detects the wid stopped resolving to the host surface.
+    await act(async () => {
+      listeners["mpv-embed-lost"]!({ payload: "embedded surface no longer resolves as mpv's wid" });
+    });
+
+    // The rogue window is never presented as in-app playback: straight to the
+    // blob-backed <video>, no lingering native stage.
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    expect(screen.queryByLabelText("Native video surface")).toBeNull();
+    const video = document.querySelector("video") as HTMLVideoElement;
+    expect(video.src).toContain("asset://");
+  });
+});

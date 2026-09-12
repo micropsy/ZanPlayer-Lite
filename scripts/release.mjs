@@ -14,7 +14,8 @@
 //   3. Verifies the working tree is clean.
 //   4. Bumps the version in all five files.
 //   5. Commits "chore: release vX.Y.Z", tags vX.Y.Z, pushes main and the tag
-//      (the tag triggers the GitHub Actions release workflow).
+//      (the tag triggers the GitHub Actions Release workflow — the only path
+//      that produces a release; plain pushes to main only run tests).
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -174,4 +175,4 @@ run("git", ["tag", `v${next}`]);
 run("git", ["push", "origin", "main"]);
 run("git", ["push", "origin", `v${next}`]);
 
-console.log(`\nReleased v${next} — tag push triggers the GitHub Actions release workflow.`);
+console.log(`\nReleased v${next} — the v${next} tag push triggers the GitHub Actions Release workflow.`);

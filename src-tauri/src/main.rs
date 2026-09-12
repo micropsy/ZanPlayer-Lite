@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod native_player;
 mod pipeline;
 
 use crate::pipeline::{StreamOptions, SubtitleCue};
@@ -609,6 +610,15 @@ fn seek_transcription(
         return Ok(());
     };
     if control.media_path == media_path && !seek_to.is_nan() {
+        // A playhead jump invalidates every cue still sitting in the render
+        // queue: they were decoded from audio before the new position. Purge
+        // them first so neither the poller nor a late merge can surface
+        // pre-seek subtitles, then reposition the live passes.
+        app.state::<RenderQueue>()
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         let _ = control.seek_tx.send(seek_to.max(0.0));
     }
     Ok(())
@@ -846,7 +856,13 @@ fn run_batch_job(
 #[tauri::command]
 async fn open_video_dialog(app: AppHandle) -> Result<Option<VideoFile>, String> {
     let file_path = app.dialog().file()
-        .add_filter("Video Files", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
+        .add_filter(
+            "Video and Audio Files",
+            &[
+                "mp4", "webm", "mkv", "avi", "mov", "m4v", "wmv", "flv", "mp3", "wav",
+                "ogg", "flac", "m4a", "aac", "wma",
+            ],
+        )
         .blocking_pick_file();
 
     let video_file = file_path.map(|p| {
@@ -1511,7 +1527,19 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(RenderQueue::default())
         .manage(SeekControl::default())
+        .manage(native_player::MpvControl::default())
+        .manage(native_player::MediaPlaybackState::default())
+        .plugin(native_player::mobile_media_init())
         .invoke_handler(tauri::generate_handler![
+native_player::mpv_is_available,
+           native_player::mpv_load,
+           native_player::mpv_set_layout,
+            native_player::mpv_play,
+            native_player::mpv_pause,
+            native_player::mpv_seek,
+            native_player::mpv_set_volume,
+            native_player::mpv_set_speed,
+            native_player::mpv_stop,
             open_video_dialog,
             open_subtitle_dialog,
             save_subtitle_dialog,
@@ -1532,6 +1560,25 @@ fn main() {
             check_model_downloaded,
             relaunch_app,
         ])
+        .setup(|app| {
+            // Env-gated native smoke test: `ZANPLAYER_NATIVE_SMOKE=1
+            // ZANPLAYER_NATIVE_SMOKE_VIDEO=<path> npm run tauri dev -- --features
+            // native-player` auto-loads a file through the real mpv session so the
+            // window surface attach + layering re-sort can be verified from logs.
+            eprintln!("[native-smoke] setup reached");
+            #[cfg(feature = "native-player")]
+            {
+                if std::env::var("ZANPLAYER_NATIVE_SMOKE").is_ok() {
+                    let handle = app.handle().clone();
+                    let video = std::env::var("ZANPLAYER_NATIVE_SMOKE_VIDEO").unwrap_or_default();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        let _ = native_player::smoke_load(&handle, &video);
+                    });
+                }
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -1,0 +1,71 @@
+name: Test
+
+# Runs on every push to main. This workflow CANNOT release anything — it only
+# compiles and runs the test suites. Releases are exclusively initiated by
+# `npm run release -- <major|minor|patch>` (and manual workflow dispatch), which
+# push a v* tag that triggers the separate `Release` workflow.
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libmpv-dev
+
+      - name: Fetch FFmpeg static binaries
+        shell: bash
+        run: |
+          mkdir -p src-tauri/binaries
+          curl -L -o src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-linux-x64
+          chmod +x src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
+      # The `native-player` (libmpv) engine is opt-in and not shipped by the
+      # release builds, but it must keep compiling AND linking on every push
+      # so the feature never silently rots between releases.
+      - name: Verify native-player feature links
+        working-directory: src-tauri
+        run: cargo build --features native-player
+
+      - name: Run frontend tests
+        run: npm run test

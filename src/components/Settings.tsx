@@ -1,5 +1,5 @@
 import { useAppStore } from "../services/store";
-import { Languages, Settings as SettingsIcon, CheckCircle2, Info, Download, Trash2, Loader2, RefreshCw, ExternalLink } from "lucide-react";
+import { Languages, Settings as SettingsIcon, Check, CheckCircle2, Info, Download, Trash2, Loader2, RefreshCw, ExternalLink, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { isTauri } from "../services/tauri";
 import { checkForUpdates } from "../services/updater";
@@ -95,21 +95,32 @@ const trackClass = (theme: string) => (theme === "dark" ? "bg-gray-700" : "bg-gr
 const Toggle = ({
   on,
   onClick,
+  label,
 }: {
   on: boolean;
   onClick: () => void;
+  label: string;
 }) => (
   <button
+    type="button"
     onClick={onClick}
-    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-      on ? "bg-zan-cyan" : "bg-gray-600"
+    role="switch"
+    aria-checked={on}
+    aria-label={label}
+    title={`${label}: ${on ? "On" : "Off"}`}
+    className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full border p-0.5 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-zan-cyan focus-visible:ring-offset-2 ${
+      on
+        ? "border-zan-cyan bg-zan-cyan/90 focus-visible:ring-offset-zan-black"
+        : "border-gray-600 bg-gray-700/80 focus-visible:ring-offset-zan-black"
     }`}
   >
     <span
-      className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
-        on ? "translate-x-6" : "translate-x-1"
+      className={`flex h-6 w-6 transform items-center justify-center rounded-full bg-white shadow-md transition-transform duration-200 ${
+        on ? "translate-x-5 text-zan-blue" : "translate-x-0 text-gray-500"
       }`}
-    />
+    >
+      {on ? <Check className="h-3.5 w-3.5" strokeWidth={3} /> : <X className="h-3 w-3" strokeWidth={2.5} />}
+    </span>
   </button>
 );
 
@@ -162,12 +173,13 @@ export const SettingsComponent = () => {
   const selectFieldClass = `px-2.5 py-1.5 rounded-lg text-sm border focus:outline-none focus:ring-1 focus:ring-zan-cyan ${controlClass(theme)}`;
 
   return (
-    <div className="p-8 space-y-8 overflow-y-auto">
-      <div className="flex items-center gap-2">
+    <div className="space-y-6 overflow-y-auto p-4 sm:space-y-8 sm:p-6">
+      <div className="flex items-center gap-3 border-b border-white/10 pb-4">
         <SettingsIcon className={`w-5 h-5 ${theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}`} />
-        <h2 className={`text-lg font-semibold ${valueClass(theme)}`}>
-          Settings
-        </h2>
+        <div>
+          <h2 className={`text-lg font-semibold ${valueClass(theme)}`}>Settings</h2>
+          <p className={`text-xs ${labelClass(theme)}`}>Personalize your playback workspace</p>
+        </div>
       </div>
 
       {/* Theme */}
@@ -201,7 +213,11 @@ export const SettingsComponent = () => {
                   ZanPlayer Lite silently looks for new versions when it launches.
                 </span>
               </div>
-              <Toggle on={autoCheckUpdates} onClick={() => setAutoCheckUpdates(!autoCheckUpdates)} />
+              <Toggle
+                on={autoCheckUpdates}
+                onClick={() => setAutoCheckUpdates(!autoCheckUpdates)}
+                label="Automatically check for updates on startup"
+              />
             </div>
             <button
               onClick={handleCheckUpdate}
@@ -525,7 +541,7 @@ export const SettingsComponent = () => {
         </div>
 
         {/* Grouped settings list */}
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 min-[330px]:grid-cols-2">
           {/* Font Family */}
           <div className={`p-4 rounded-xl border flex flex-col gap-2 ${card(theme)}`}>
             <span className={`text-sm ${theme === 'dark' ? 'text-gray-300' : 'text-gray-700'}`}>
@@ -656,6 +672,7 @@ export const SettingsComponent = () => {
             <Toggle
               on={subtitleStyle.bold}
               onClick={() => setSubtitleStyle({ bold: !subtitleStyle.bold })}
+              label="Bold subtitles"
             />
           </div>
 
@@ -667,6 +684,7 @@ export const SettingsComponent = () => {
             <Toggle
               on={subtitleStyle.italic}
               onClick={() => setSubtitleStyle({ italic: !subtitleStyle.italic })}
+              label="Italic subtitles"
             />
           </div>
 

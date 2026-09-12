@@ -138,10 +138,41 @@ ZanPlayer Lite/
 ├── src-tauri/                  # Backend (Rust/Tauri)
 │   ├── src/main.rs             # Commands: whisper dual-pass jobs, live seek control, ffmpeg, subtitles, model downloads
 │   ├── src/pipeline.rs         # Silero VAD -> chunked Whisper decode (translate on/off) -> PTS sync + seek reset
+│   ├── src/native_player/      # Native playback engines (mpv on desktop, mobile plugin bridge)
+│   ├── mobile/                 # Native mobile plugin sources (Android Media3 / iOS AVPlayer) + READMEs
 │   ├── Cargo.toml / tauri.conf.json
 │   └── capabilities/main.json  # Tauri 2 permissions
 └── .github/workflows/build.yml # CI: builds + creates releases for all 4 platforms
 ```
+
+## Native Playback Backends
+
+Playback is HTML5 `<video>` by default, but ZanPlayer ships dedicated native
+engines behind a single `mpv_*` command surface — the webview never knows which
+one is underneath:
+
+| Platform | Engine | Gate |
+|---|---|---|
+| macOS | libmpv **Render API** → CAMetalLayer (behind the transparent webview) | `--features native-player,macos-render` |
+| Windows | libmpv `wid` embed (child HWND anchored to the DOM stage) | `--features native-player` |
+| Linux (X11) | libmpv `wid` embed (XID anchored to the DOM stage) | `--features native-player` |
+| Android | Media3 **ExoPlayer** (`src-tauri/mobile/android/MediaPlaybackPlugin.kt`) | mobile plugin (in development) |
+| iOS | AVFoundation **AVPlayer** (`src-tauri/mobile/apple/MediaPlaybackPlugin.swift`) | mobile plugin (in development) |
+
+Every backend emits the same 250 ms coalesced `mpv-timeupdate` payload, routes
+seeks through one native funnel, and signals `mpv-embed-lost` to drop back to
+HTML5 when the surface is lost. Shipped desktop builds are feature-off (HTML5);
+see `AGENTS.md` for the engine notes.
+
+### Mobile status (honest)
+
+The Rust side of the mobile bridge (session `MobileSession`, plugin
+registration, position ticker, fallback) is implemented and covered by unit
+tests. The **Kotlin and Swift plugin sources are written but have never been
+compiled or run** — the development machine has no JDK, Android SDK, Xcode, or
+Rust mobile toolchains. Read `src-tauri/mobile/android/README.md` and
+`src-tauri/mobile/apple/README.md` for exact integration steps and the
+device-time checklist.
 
 ## Technologies
 

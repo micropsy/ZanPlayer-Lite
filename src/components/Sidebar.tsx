@@ -19,6 +19,12 @@ import { TauriService, type ProjectData } from "../services/tauri";
 import { SettingsComponent } from "./Settings";
 import { cn } from "../utils/cn";
 import type { SubtitleTrack } from "../types/subtitle";
+import {
+  mediaAcceptString,
+  subtitleAcceptString,
+  isMediaFile,
+  isParsableSubtitleFile,
+} from "../common/mediaFormats";
 
 type Tab = "main" | "settings";
 
@@ -61,13 +67,13 @@ export const Sidebar = () => {
 
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const file = e.dataTransfer.files[0];
-      if (file.type.startsWith("video/")) {
+      if (isMediaFile(file.name)) {
         resetSubtitles();
         setCurrentVideo(file);
         const url = URL.createObjectURL(file);
         setCurrentVideoUrl(url);
         setCurrentVideoPath(null);
-      } else if (file.name.endsWith(".srt") || file.name.endsWith(".vtt")) {
+      } else if (isParsableSubtitleFile(file.name)) {
         // Handle subtitle file
         try {
           const text = await file.text();
@@ -151,14 +157,14 @@ export const Sidebar = () => {
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      if (file.type.startsWith("video/")) {
+      if (isMediaFile(file.name)) {
         resetSubtitles();
         setCurrentVideo(file);
         const url = URL.createObjectURL(file);
         setCurrentVideoUrl(url);
         setCurrentVideoPath(null);
         setErrorMessage(null);
-      } else if (file.name.endsWith(".srt") || file.name.endsWith(".vtt")) {
+      } else if (isParsableSubtitleFile(file.name)) {
         // Handle subtitle file
         try {
           file.text().then(text => {
@@ -339,12 +345,12 @@ export const Sidebar = () => {
 
 
   return (
-    <div 
+    <aside
       className={cn(
-        "w-96 border-r flex flex-col h-full relative",
+        "absolute inset-y-0 left-0 z-40 flex h-full w-[min(22rem,calc(100vw-1rem))] max-w-full shrink-0 flex-col border-r shadow-2xl shadow-black/20 md:relative md:z-10 md:shadow-none",
         theme === "dark" 
-          ? "bg-zan-black border-gray-700" 
-          : "bg-white border-gray-200"
+          ? "border-white/10 bg-zan-black" 
+          : "border-gray-200 bg-white"
       )}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
@@ -361,44 +367,39 @@ export const Sidebar = () => {
       )}
       {/* Header Row */}
       <div className={cn(
-        "flex items-center border-b",
-        theme === "dark" ? "border-gray-700" : "border-gray-200"
+        "flex min-h-[4.25rem] items-center gap-1 border-b px-2",
+        theme === "dark" ? "border-white/10 bg-zan-black" : "border-gray-200 bg-white"
       )}>
         {/* App Logo */}
-        <div className="flex items-center gap-3 px-4 py-3">
+        <button
+          onClick={() => setActiveTab("main")}
+          aria-label="ZanPlayer Lite home"
+          title="ZanPlayer Lite"
+          className={cn(
+            "flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-2 text-left transition-colors",
+            theme === "dark" ? "hover:bg-white/5" : "hover:bg-gray-100"
+          )}
+        >
           <img 
             src="/logo.png" 
             alt="ZanPlayer Lite" 
-            className="w-10 h-10 rounded-lg"
+            className="h-8 w-8 rounded-lg object-cover"
           />
-          <span className="text-xl font-bold text-white">ZanPlayer Lite</span>
-        </div>
-        <button
-          onClick={() => setActiveTab("main")}
-          className={cn(
-            "flex-1 py-3 px-4 text-sm font-medium transition-colors",
-            activeTab === "main"
-              ? theme === "dark"
-                ? "bg-zan-blue/15 text-white border-b-2 border-zan-cyan"
-                : "bg-gray-100 text-gray-900 border-b-2 border-zan-cyan"
-              : theme === "dark"
-                ? "text-gray-500 hover:text-gray-300"
-                : "text-gray-500 hover:text-gray-700"
-          )}
-        >
-          <div className="flex items-center justify-center gap-2">
-            <List className="w-4 h-4" />
-            Main
-          </div>
+          <span className={cn(
+            "whitespace-nowrap text-xs font-bold leading-tight",
+            theme === "dark" ? "text-white" : "text-gray-900"
+          )}>ZanPlayer Lite</span>
         </button>
         <button
-          onClick={() => setActiveTab("settings")}
+          onClick={() => setActiveTab(activeTab === "settings" ? "main" : "settings")}
+          aria-label={activeTab === "settings" ? "Return to main" : "Open settings"}
+          title={activeTab === "settings" ? "Return to main" : "Settings"}
           className={cn(
-            "p-3 transition-colors",
+            "flex h-10 w-10 items-center justify-center rounded-lg transition-colors",
             activeTab === "settings"
               ? theme === "dark"
-                ? "bg-zan-blue/15 text-white border-b-2 border-zan-cyan"
-                : "bg-gray-100 text-gray-900 border-b-2 border-zan-cyan"
+                ? "bg-zan-blue/25 text-white ring-1 ring-inset ring-zan-cyan/60"
+                : "bg-gray-100 text-gray-900 ring-1 ring-inset ring-zan-cyan"
               : theme === "dark"
                 ? "text-gray-500 hover:text-gray-300"
                 : "text-gray-500 hover:text-gray-700"
@@ -408,21 +409,23 @@ export const Sidebar = () => {
         </button>
         <button
           onClick={() => setSidebarVisible(false)}
+          aria-label="Close sidebar"
+          title="Close sidebar"
           className={cn(
-            "p-3 transition-colors",
+            "flex h-10 w-10 items-center justify-center rounded-lg transition-colors",
             theme === "dark"
-              ? "hover:bg-zan-blue/15 text-gray-400 hover:text-white"
-              : "hover:bg-gray-100 text-gray-500 hover:text-gray-700"
+              ? "text-gray-400 hover:bg-zan-blue/15 hover:text-white"
+              : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"
           )}
         >
-          <Menu className="w-5 h-5" />
+          <Menu className="h-5 w-5" />
         </button>
       </div>
 
       {activeTab === "main" && (
         <div className="flex-1 flex flex-col overflow-hidden">
           <div className={cn(
-            "p-6 border-b",
+            "border-b p-4 sm:p-5",
             theme === "dark"
               ? "border-gray-700 bg-gradient-to-b from-zan-deep to-zan-black"
               : "border-gray-200 bg-gradient-to-b from-gray-50 to-white"
@@ -455,7 +458,7 @@ export const Sidebar = () => {
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept="video/*"
+                  accept={mediaAcceptString()}
                   className="hidden"
                   onChange={handleFileInputChange}
                 />
@@ -463,7 +466,7 @@ export const Sidebar = () => {
               <input
                 ref={subtitleFileInputRef}
                 type="file"
-                accept=".srt,.vtt"
+                accept={subtitleAcceptString()}
                 className="hidden"
                 onChange={handleFileInputChange}
               />
@@ -696,6 +699,6 @@ export const Sidebar = () => {
           <SettingsComponent />
         </div>
       )}
-    </div>
+    </aside>
   );
 };

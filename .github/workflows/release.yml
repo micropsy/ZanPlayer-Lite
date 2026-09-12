@@ -1,19 +1,15 @@
-name: Build ZanPlayer Lite
+name: Release
 
-# Two-tier pipeline:
-#   - `test`  runs on every push to main (and on tag pushes) — cargo test +
-#             vitest only, keeping regular commits cheap on CI minutes.
-#   - `build` (the heavy Tauri release matrix: signed dmg/appimage/deb/msi on
-#             4 runners) runs ONLY when a version tag (v*) is pushed by the
-#             release script, or manually via workflow_dispatch. Plain branch
-#             pushes to main never trigger it.
+# Builds and publishes a release. This workflow runs ONLY when:
+#   - a `v*` tag is pushed — which is done exclusively by the release script
+#     (`npm run release -- <major|minor|patch>`) — or
+#   - `workflow_dispatch` is used to trigger it manually.
+# Plain pushes to `main` run the separate `Test` workflow and never release.
 # GitHub executes the workflow file from the pushed tag, so every released
 # tag's commit must carry a copy of this workflow.
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
     tags:
       - "v*"
 
@@ -21,53 +17,8 @@ permissions:
   contents: write
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Setup Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
-      - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Run Rust tests
-        working-directory: src-tauri
-        run: cargo test
-
-      - name: Run frontend tests
-        run: npm run test
-
   build:
-    # Gate the release matrix behind version tags so ordinary pushes to main
-    # (which fire this workflow via the `branches: [main]` trigger above) only
-    # pay for the lightweight `test` job. Manual workflow_dispatch still works.
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    # Release matrix: signed dmg/appimage/deb/msi on 4 runners.
     strategy:
       fail-fast: false
       matrix:

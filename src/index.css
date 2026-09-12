@@ -1,5 +1,17 @@
 @import "tailwindcss";
 
+/* The Tauri window is transparent so the native mpv surface (embedded behind
+   the webview) is visible through the player stage. Every opaque surface in
+   the app paints its own background in DOM; only the video stage leans on the
+   transparency. Keep the root background clean for that contract. */
+@layer base {
+  html,
+  body,
+  #root {
+    background: transparent;
+  }
+}
+
 @theme {
   --color-zan-cyan: #61d0d4;
   --color-zan-blue: #1954a6;

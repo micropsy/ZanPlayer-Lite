@@ -37,6 +37,23 @@ export interface InterfaceVideoFile {
   name: string;
 }
 
+/** Live clock snapshot pushed by the native mpv session (250 ms ticker). */
+export interface MpvTimeUpdatePayload {
+  position: number;
+  duration: number;
+  paused: boolean;
+  ended: boolean;
+}
+
+/** Mirrors the Rust `SurfaceLayout` (DOM video-stage rect in CSS px, top-left
+ * origin) used to re-anchor the embedded mpv surface onto the React stage. */
+export interface SurfaceLayout {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 // Mirrors the Rust `ProjectData` struct (see src-tauri/src/main.rs). The
 // `.zan` project file is plain JSON keyed in camelCase, so this interface maps
 // 1:1 onto both the on-disk schema and the store's hydration action.
@@ -325,5 +342,84 @@ export class TauriService {
       throw new Error("This feature requires the Tauri app");
     }
     await invoke<void>("relaunch_app");
+  }
+
+  // -------------------------------------------------------------------------
+  // Native player capability. The backend (libmpv on Windows/Linux/macOS, the
+  // Media3/AVPlayer mobile plugin on Android/iOS) decides availability via
+  // `mpv_is_available`; Web and builds without the native backend return false
+  // so the UI falls back to <video>. Every call resolves cleanly when native
+  // playback is unavailable.
+  // -------------------------------------------------------------------------
+
+  /** Whether the current build includes the native mpv playback engine. */
+  static async isNativePlayerAvailable(): Promise<boolean> {
+    if (!isTauri()) {
+      return false;
+    }
+    try {
+      return (await invoke<boolean>("mpv_is_available")) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  static async mpvLoad(path: string): Promise<void> {
+    if (!isTauri()) {
+      return;
+    }
+    await invoke<void>("mpv_load", { path });
+  }
+
+  // Re-anchor the embedded mpv surface onto the DOM video stage. The Rust side
+  // flips the CSS (top-left) rect into native coordinates and frames the host
+  // NSView / resizes the mpv child viewport so playback tracks the container.
+  static async mpvSetLayout(rect: SurfaceLayout): Promise<void> {
+    if (!isTauri()) {
+      return;
+    }
+    await invoke<void>("mpv_set_layout", { rect });
+  }
+
+  static async mpvPlay(): Promise<void> {
+    if (!isTauri()) {
+      return;
+    }
+    await invoke<void>("mpv_play");
+  }
+
+  static async mpvPause(): Promise<void> {
+    if (!isTauri()) {
+      return;
+    }
+    await invoke<void>("mpv_pause");
+  }
+
+  static async mpvSeek(position: number): Promise<void> {
+    if (!isTauri()) {
+      return;
+    }
+    await invoke<void>("mpv_seek", { position });
+  }
+
+  static async mpvSetVolume(level: number): Promise<void> {
+    if (!isTauri()) {
+      return;
+    }
+    await invoke<void>("mpv_set_volume", { level });
+  }
+
+  static async mpvSetSpeed(speed: number): Promise<void> {
+    if (!isTauri()) {
+      return;
+    }
+    await invoke<void>("mpv_set_speed", { speed });
+  }
+
+  static async mpvStop(): Promise<void> {
+    if (!isTauri()) {
+      return;
+    }
+    await invoke<void>("mpv_stop");
   }
 }

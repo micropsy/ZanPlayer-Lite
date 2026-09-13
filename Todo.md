@@ -150,7 +150,7 @@ and do not break normal HTML5 playback.
 - [x] Run `npm run test`.
 - [x] Run `cargo test`.
 - [x] Run `cargo test --features native-player,macos-render` on macOS.
-- [ ] Run platform builds where toolchains are available.
+- [x] Run platform builds where toolchains are available (macOS `app,dmg` release build verified locally; signing needs the CI `TAURI_SIGNING_PRIVATE_KEY`).
 - [x] Mark untested platforms as unverified instead of claiming support.
 
 Acceptance: release notes clearly distinguish implemented, device-tested and

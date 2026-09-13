@@ -54,7 +54,9 @@ exactly.
 The iOS plugin is a Swift package: add it as a dependency in
 `src-tauri/gen/apple/Package.swift` (or wherever Tauri's generated project
 expects third-party plugins), and ensure the app's deployment target is
-**iOS 15.0** or later (see `tauri.conf.json` `bundle.ios.minimumSystemVersion`).
+**iOS 15.0** or later. Set it as `IPHONEOS_DEPLOYMENT_TARGET` in the generated
+Xcode project — do NOT add `bundle.ios` to `tauri.conf.json`, because the
+desktop `tauri-cli` (v2.11.3) rejects that key and breaks every desktop build.
 
 ### AVPlayer vs AVPlayerLayer
 

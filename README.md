@@ -137,8 +137,10 @@ or run on a device. Prerequisites per platform:
   `aarch64-apple-ios` and `aarch64-apple-ios-sim`, and CocoaPods for the Tauri
   iOS harness. `npx tauri ios init` scaffolds `src-tauri/gen/apple`; then
   integrate `src-tauri/mobile/apple/MediaPlaybackPlugin.swift` per
-  `src-tauri/mobile/apple/README.md`. Requires iOS ≥ 15.0 (set in
-  `tauri.conf.json`).
+  `src-tauri/mobile/apple/README.md`. iOS ≥ 15.0 must be set as the
+  `IPHONEOS_DEPLOYMENT_TARGET` in the generated Xcode project — `tauri.conf.json`
+  `bundle.ios` is rejected by the desktop `tauri-cli` (v2.11.3) and must not be
+  added there.
 
 Neither mobile plugin has been compiled on a real machine yet — expect
 device-time fixes. See the two `src-tauri/mobile/*/README.md` files for the

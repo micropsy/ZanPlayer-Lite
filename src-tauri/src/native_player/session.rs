@@ -9,14 +9,30 @@
     allow(dead_code)
 )]
 use crate::native_player::{
-    position_clamped, snapshot_changed, MpvTimeUpdate, SurfaceLayout,
+    position_clamped, MpvTimeUpdate, SurfaceLayout,
 };
+// The wid-path `MpvSession`'s dependencies (its ticker uses Duration + Emitter,
+// its struct holds Arc<AtomicBool>, its load loop coalesces via snapshot_changed)
+// are only referenced there; the Render API backend owns its own ticker in
+// `render/macos_render.rs`. Gate them so the macOS+macos-render build has no
+// unresolved-import warnings.
+#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
+use crate::native_player::snapshot_changed;
+#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
 use std::sync::Arc;
+#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
+#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
+use tauri::Emitter;
 
 /// Embedded libmpv session wired to the main window's native surface.
+/// Excluded on macOS when the Render API backend is active (`macos-render`):
+/// that path never touches `wid`, and keeping the window-VO here compiled
+/// would leave a second, structurally different mpv surface in the build.
+#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
 pub struct MpvSession {
     mpv: Arc<libmpv2::Mpv>,
     ticking: Arc<AtomicBool>,
@@ -26,6 +42,7 @@ pub struct MpvSession {
     surface: i64,
 }
 
+#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
 impl MpvSession {
     pub fn new(app: &AppHandle) -> Result<Self, String> {
         // libmpv2 targets the 2.x client API (this crate links client API 2.2;
@@ -358,6 +375,20 @@ fn sanitize_surface_layout(rect: SurfaceLayout) -> SurfaceLayout {
     }
 }
 
+/// Runtime gate for the `[mpv-layout]` / `[mpv-set-layout]` / `[render-dbg]`
+/// diagnostic lines. Debug builds always trace (the historical default); release
+/// builds only when `ZANPLAYER_TRACE` is set — so a packaged app can be
+/// instrumented without rebuilding, and `cargo build --release` stays quiet by
+/// default. The lines are layout-change-only (the JS reporter coalesces to whole
+/// px before dispatching), so they fire exactly on sidebar toggles, window
+/// drag-resizes and fullscreen transitions — never per-frame.
+pub(crate) fn trace_enabled() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| {
+        cfg!(debug_assertions) || std::env::var("ZANPLAYER_TRACE").is_ok()
+    })
+}
+
 /// macOS embed-surface management. The root cause of "mpv opens a separate
 /// floating window" on macOS is embedding into WKWebView: WebKit owns its
 /// subview hierarchy and prunes/forgets foreign views, so mpv's video view ends
@@ -375,7 +406,7 @@ fn sanitize_surface_layout(rect: SurfaceLayout) -> SurfaceLayout {
 ///     mpv window, so the frontend falls back to HTML5.
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_surface {
-    use super::{sanitize_surface_layout, window_surface};
+    use super::{sanitize_surface_layout, trace_enabled, window_surface};
     use crate::native_player::SurfaceLayout;
     use objc2::encode::{Encode, Encoding};
     use objc2::msg_send;
@@ -526,10 +557,22 @@ pub(crate) mod macos_surface {
                     }
                 }
             }
-            // Stretch to the full content area by default; `apply_layout` then
-            // re-anchors onto the exact DOM-stage rect reported by the frontend.
-            let bounds: NSRect = msg_send![content, bounds];
-            let _: () = msg_send![host, setFrame: bounds];
+            // Initial (pre-layout) geometry, per backend:
+            //  - macos-render (Render API): the host must START hidden /
+            //    zero-size and non-presenting. It only becomes visible — at
+            //    exactly the stage size, never a full-window intermediate —
+            //    once the first `mpv_set_layout` rect arrives. A full-content
+            //    frame here would hand `apply_position` a whole-window host
+            //    between engine switch and the first DOM measure.
+            //  - wid path (non-macos-render Linux/Windows, and macOS-wid):
+            //    mpv's window VO needs a real sized embed target at init
+            //    time, so stretch it to the content area now; the layout
+            //    reporter re-anchors it exactly afterward.
+            #[cfg(feature = "macos-render")]
+            let initial_frame = cg_rect(0.0, 0.0, 0.0, 0.0);
+            #[cfg(not(feature = "macos-render"))]
+            let initial_frame: NSRect = msg_send![content, bounds];
+            let _: () = msg_send![host, setFrame: initial_frame];
             *guard = Some(ViewPtr(host));
             Ok(host)
         }
@@ -554,12 +597,56 @@ pub(crate) mod macos_surface {
         }
     }
 
+    /// Read back where the host view ACTUALLY ended up, expressed in the same
+    /// webview-local top-left CSS-px space as the DOM rect (inverse of
+    /// `apply_layout`). Used by the smoke harness to assert the rendered frame
+    /// — not the requested rect — matches the DOM stage.
+    pub fn applied_js_rect(app: &tauri::AppHandle) -> Result<(f64, f64, f64, f64), String> {
+        let content = content_view(app)?;
+        let host = host_view(app)?;
+        let webview = webview_view(content)?;
+        unsafe {
+            let bounds: NSRect = msg_send![webview, bounds];
+            let webview_frame: NSRect = msg_send![webview, frame];
+            let frame: NSRect = msg_send![host, frame];
+            let x = frame.origin.x - webview_frame.origin.x;
+            let y = (webview_frame.origin.y + bounds.size.height) - (frame.origin.y + frame.size.height);
+            Ok((x, y, frame.size.width, frame.size.height))
+        }
+    }
+
+    /// WebView geometry for the structured layout trace, in points:
+    /// `(bounds.w, bounds.h, frame.x, frame.y, frame.w, frame.h)`. This is the
+    /// coordinate space the DOM rects arrive in — the 1:1 CSS-px mapping layer.
+    pub fn webview_geometry(app: &tauri::AppHandle) -> Result<(f64, f64, f64, f64, f64, f64), String> {
+        let content = content_view(app)?;
+        let webview = webview_view(content)?;
+        unsafe {
+            let bounds: NSRect = msg_send![webview, bounds];
+            let frame: NSRect = msg_send![webview, frame];
+            Ok((
+                bounds.size.width,
+                bounds.size.height,
+                frame.origin.x,
+                frame.origin.y,
+                frame.size.width,
+                frame.size.height,
+            ))
+        }
+    }
+
     /// Re-frame the host NSView onto the DOM stage rect (CSS pixels, relative to
     /// the webview content area, top-left origin). The rect is converted from
     /// webview-local points into content-view coordinates via AppKit so
     /// titlebar insets, window chrome and content scale are handled exactly.
     pub fn apply_layout(app: &tauri::AppHandle, rect: SurfaceLayout) -> Result<(), String> {
         let rect = sanitize_surface_layout(rect);
+        // A degenerate or not-yet-laid-out stage must never move the surface to
+        // (0,0)/zero size (the "video stuck at the top-left" symptom): keep the
+        // last good anchor instead.
+        if rect.width < 1.0 || rect.height < 1.0 {
+            return Ok(());
+        }
         let content = content_view(app)?;
         let host = host_view(app)?;
         let webview = webview_view(content)?;
@@ -568,20 +655,52 @@ pub(crate) mod macos_surface {
             if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
                 return Ok(()); // not laid out yet — nothing meaningful to anchor to
             }
-            // getBoundingClientRect uses a top-left origin; NSView uses
-            // bottom-left. Flip within the webview's space, then let AppKit
-            // convert into the shared content coordinates (titlebar-safe).
-            let local = cg_rect(
-                rect.x.max(0.0),
-                (bounds.size.height - (rect.y + rect.height)).max(0.0),
-                rect.width.max(0.0),
-                rect.height.max(0.0),
+            // The DOM rect comes from getBoundingClientRect (top-left origin).
+            // The webview and the host view are unflipped sibling NSViews inside
+            // the content view, so the host frame in CONTENT coordinates is
+            // computed directly — no `convertRect:fromView:` (its result
+            // depends on the destination view's *current* frame, so one wrong
+            // frame made every later frame wrong and the surface drifted off
+            // the stage). Clamp the rect into the webview's content area so an
+            // edge/corner stage can never land outside the window.
+            let clamp = |v: f64, max: f64| v.max(0.0).min(max);
+            let x = clamp(rect.x, bounds.size.width - 1.0);
+            let y_css = clamp(rect.y, bounds.size.height - 1.0);
+            let w = clamp(rect.width, bounds.size.width - x);
+            let h = clamp(rect.height, bounds.size.height - y_css);
+            // Sibling of the webview inside the same (unflipped) content view:
+            // +X +Y of the local rect map 1:1 onto the content frame offset
+            // (bottom-left origin), with the webview's own frame offset added.
+            let webview_frame: NSRect = msg_send![webview, frame];
+            let frame_in_content = cg_rect(
+                webview_frame.origin.x + x,
+                webview_frame.origin.y + (bounds.size.height - (y_css + h)),
+                w,
+                h,
             );
-            let frame_in_content: NSRect = msg_send![host, convertRect: local, fromView: webview];
-            // Guard against a zero-size anchor under the webview (nothing to
-            // show): still frame it, but the stage is degenerate either way.
+            if trace_enabled() {
+                eprintln!(
+                    "[mpv-layout] js=({:.0},{:.0}) {:.0}x{:.0} webview={:.0}x{:.0}@({:.0},{:.0}) -> content=({:.1},{:.1}) {:.1}x{:.1}",
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    bounds.size.width,
+                    bounds.size.height,
+                    webview_frame.origin.x,
+                    webview_frame.origin.y,
+                    frame_in_content.origin.x,
+                    frame_in_content.origin.y,
+                    frame_in_content.size.width,
+                    frame_in_content.size.height
+                );
+            }
             let _: () = msg_send![host, setFrame: frame_in_content];
             let _: () = msg_send![host, setNeedsDisplay: 1i8];
+            // Ask the hierarchy to commit the frame immediately instead of
+            // waiting for the next AppKit layout pass; the render path flushes
+            // the implicit CATransaction right after this.
+            let _: () = msg_send![content, setNeedsLayout: 1i8];
         }
         Ok(())
     }

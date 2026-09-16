@@ -8,4 +8,4 @@
 mod macos_render;
 
 #[cfg(all(target_os = "macos", feature = "macos-render"))]
-pub(crate) use macos_render::{apply_surface_layout, RenderSession};
+pub(crate) use macos_render::{apply_surface_layout, layout_debug_enabled, RenderSession};

@@ -111,3 +111,28 @@ export const mediaAcceptString = (): string => "video/*,audio/*,"
 /** `accept` attribute for the subtitle file input. */
 export const subtitleAcceptString = (): string =>
   [...PARSABLE_SUBTITLE_EXTENSIONS].map((e) => `.${e}`).join(",");
+
+// Containers the built-in HTML5 <video>/<audio> engines can actually demux.
+// WebKit/Safari cannot demux Matroska (.mkv), AVI, FLV or ASF (.wmv) at all;
+// Chromium only plays a narrow codec subset inside MKV. The native mpv engine
+// handles every cataloged container, so these surfaces are only hit when the
+// native engine is unavailable (PWA/web, or a desktop build without the
+// feature) — where a silent black frame is worse than a clear message.
+const HTML5_VIDEO_EXTENSIONS = ["mp4", "m4v", "mov", "webm"] as const;
+const HTML5_AUDIO_EXTENSIONS = ["mp3", "wav", "ogg", "flac", "m4a", "aac"] as const;
+
+/** True when the HTML5 fallback engine can realistically decode this file. */
+export const isHtml5Playable = (fileName: string): boolean => {
+  const ext = extensionOf(fileName);
+  return (
+    (HTML5_VIDEO_EXTENSIONS as readonly string[]).includes(ext) ||
+    (HTML5_AUDIO_EXTENSIONS as readonly string[]).includes(ext)
+  );
+};
+
+/** Human-readable hint when a container can't play on the fallback engine. */
+export const html5UnsupportedHint = (fileName: string): string | null => {
+  if (!isMediaFile(fileName)) return null;
+  if (isHtml5Playable(fileName)) return null;
+  return `"${fileName}" uses a ${extensionOf(fileName).toUpperCase()} container that this fallback player can't decode. Convert it to MP4/WebM or use the native engine.`;
+};

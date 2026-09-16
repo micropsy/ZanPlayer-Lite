@@ -15,7 +15,8 @@ import {
   FolderOpen,
 } from "lucide-react";
 import { emit } from "@tauri-apps/api/event";
-import { TauriService, type ProjectData } from "../services/tauri";
+import { TauriService, isMobileDevice, type ProjectData } from "../services/tauri";
+import { sidebarLayoutMode } from "../services/videoLayout";
 import { SettingsComponent } from "./Settings";
 import { cn } from "../utils/cn";
 import type { SubtitleTrack } from "../types/subtitle";
@@ -342,12 +343,29 @@ export const Sidebar = () => {
 
   const hasTracks = !!activeSubtitleTrackId;
 
+  // The sidebar must OUT-STACK the whole player subtree on every platform:
+  // `z-40` at ALL widths. The player column is z-0 (its own stacking context),
+  // so its z-30/z-40/z-50 overlays stay trapped underneath.
+  //
+  // How the sidebar occupies space is PLATFORM-driven (`sidebarLayoutMode`),
+  // never just viewport width: on desktop (macOS/Windows/Linux + desktop
+  // browsers) it is ALWAYS inline — `relative`, in the flex row, pushing the
+  // video aside even in a narrow window. Only real touch devices
+  // (Android/iOS below `md`) get the `absolute` drawer that overlays the
+  // video; the `md:relative` upgrade keeps a rotated phone/tablet inline.
+  const mode = sidebarLayoutMode(isMobileDevice(), window.innerWidth);
+  const positionCls =
+    mode === "drawer"
+      ? "absolute inset-y-0 left-0 shadow-2xl shadow-black/20 md:relative md:shadow-none"
+      : "relative";
+
 
 
   return (
     <aside
+      data-sidebar
       className={cn(
-        "absolute inset-y-0 left-0 z-40 flex h-full w-[min(22rem,calc(100vw-1rem))] max-w-full shrink-0 flex-col border-r shadow-2xl shadow-black/20 md:relative md:z-10 md:shadow-none",
+        `flex h-full w-[min(22rem,calc(100vw-1rem))] max-w-full shrink-0 flex-col border-r z-40 ${positionCls}`,
         theme === "dark" 
           ? "border-white/10 bg-zan-black" 
           : "border-gray-200 bg-white"

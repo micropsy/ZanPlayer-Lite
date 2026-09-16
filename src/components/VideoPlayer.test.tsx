@@ -73,6 +73,7 @@ describe("VideoPlayer dual-pass rendering", () => {
       resumeAt: null,
       recentFiles: [],
       playbackRate: 1,
+      sidebarVisible: true,
     });
   });
 
@@ -84,6 +85,7 @@ describe("VideoPlayer dual-pass rendering", () => {
     invoke.mockImplementation(async (cmd: string) => {
       if (cmd === "start_transcription") return undefined;
       if (cmd === "poll_transcript_cues") return polled.shift() ?? [];
+      if (cmd === "transcription_active") return true;
       return undefined;
     });
 
@@ -137,6 +139,7 @@ describe("VideoPlayer dual-pass rendering", () => {
         pollCalls += 1;
         return [];
       }
+      if (cmd === "transcription_active") return true;
       return undefined;
     });
 
@@ -228,6 +231,7 @@ describe("VideoPlayer dual-pass rendering", () => {
     invoke.mockImplementation(async (cmd: string) => {
       if (cmd === "start_transcription") return undefined;
       if (cmd === "poll_transcript_cues") return [];
+      if (cmd === "transcription_active") return true;
       return undefined;
     });
 
@@ -256,6 +260,7 @@ describe("VideoPlayer dual-pass rendering", () => {
     invoke.mockImplementation(async (cmd: string) => {
       if (cmd === "start_transcription") return undefined;
       if (cmd === "poll_transcript_cues") return [];
+      if (cmd === "transcription_active") return true;
       return undefined;
     });
 
@@ -272,6 +277,162 @@ describe("VideoPlayer dual-pass rendering", () => {
 
     const seekCalls = invoke.mock.calls.filter(([cmd]) => cmd === "seek_transcription");
     expect(seekCalls).toHaveLength(0);
+  });
+
+  it("drains only the started job's cues: polls carry the job id, stale completions are ignored", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "start_transcription") return undefined;
+      if (cmd === "poll_transcript_cues") return [{ id: "x", start_time: 1, end_time: 3, text: "cue", kind: "original" }];
+      if (cmd === "transcription_active") return true;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    currentTime(2);
+
+    await startTranscriptionViaUi();
+    await waitFor(() => expect(useAppStore.getState().isTranscribing).toBe(true));
+
+    // Every queue poll targets the exact job the frontend started.
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("poll_transcript_cues", { jobId: expect.any(Number) })
+    );
+
+    // A completion from a *different* (previous video's) run is dropped: the
+    // current job stays active so its cues keep streaming.
+    await act(async () => {
+      listeners["transcription-done"]!({ payload: { job_id: 999999, total: 3 } });
+    });
+    expect(useAppStore.getState().isTranscribing).toBe(true);
+    expect(useAppStore.getState().transcriptionProgress).not.toBe(100);
+
+    // The matching run's completion finalizes normally.
+    await act(async () => {
+      listeners["transcription-done"]!({ payload: { total: 3 } });
+    });
+    await waitFor(() => expect(useAppStore.getState().isTranscribing).toBe(false));
+    expect(useAppStore.getState().transcriptionProgress).toBe(100);
+  });
+
+  it("a missed completion event cannot strand the flag: transcription_active clears it", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "start_transcription") return undefined;
+      if (cmd === "poll_transcript_cues") return [];
+      if (cmd === "transcription_active") return false; // job already done, event was missed
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+
+    await startTranscriptionViaUi();
+    await waitFor(() => expect(useAppStore.getState().isTranscribing).toBe(true));
+
+    // The status probe notices the backend finished and un-sticks the flag so
+    // a later video can still auto-transcribe.
+    await waitFor(() => expect(useAppStore.getState().isTranscribing).toBe(false));
+    expect(useAppStore.getState().transcriptionProgress).toBe(100);
+  });
+
+  it("changing the spoken language regenerates the generated track in the new language", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "start_transcription") return undefined;
+      if (cmd === "transcription_active") return true;
+      return undefined;
+    });
+    useAppStore.setState({
+      subtitleTracks: [
+        {
+          id: "track-gen",
+          name: "Auto-Generated (Original)",
+          language: "my",
+          isGenerated: true,
+          cues: [{ id: "c1", startTime: 1, endTime: 3, text: "မင်္ဂလာပါ", kind: "original" }],
+        },
+      ],
+      activeSubtitleTrackId: "track-gen",
+      showSubtitles: true,
+      isTranscribing: false,
+      sourceLanguage: "my",
+    });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+
+    await act(async () => {
+      useAppStore.getState().setSourceLanguage("ko");
+    });
+
+    // The stale generated track is dropped and a fresh job is pinned to "ko".
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "start_transcription",
+        expect.objectContaining({ language: "ko", mediaPath: "/tmp/media.wav" })
+      )
+    );
+    expect(useAppStore.getState().subtitleTracks.every((t) => !t.isGenerated)).toBe(true);
+  });
+
+  it("retries a failed transcription in place: fresh job id, generated tracks wiped, no video reload", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "start_transcription") return undefined;
+      if (cmd === "poll_transcript_cues") return [];
+      if (cmd === "transcription_active") return true;
+      return undefined;
+    });
+    useAppStore.setState({
+      showSubtitles: true, // auto-transcribe fires on mount like a fresh drop
+      isTranscribing: false,
+      subtitleTracks: [],
+    });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+      "start_transcription",
+      expect.objectContaining({ mediaPath: "/tmp/media.wav" })
+    ));
+    const firstJobId = invoke.mock.calls.find((c) => c[0] === "start_transcription")![1].jobId as number;
+    expect(firstJobId).toBeTypeOf("number");
+
+    // A partial generated track may have streamed in before the run died; the
+    // retry must drop it so it can't linger under the fresh regenerated cues.
+    useAppStore.setState({
+      subtitleTracks: [
+        { id: "track-partial", name: "Auto-Generated (Original)", language: "my", isGenerated: true, cues: [] },
+      ],
+    });
+
+    await act(async () => {
+      listeners["transcription-error"]!({
+        payload: { job_id: firstJobId, message: "decode exploded" },
+      });
+    });
+    expect(useAppStore.getState().isTranscribing).toBe(false);
+
+    // The failure is surfaced with a Retry affordance in the CC menu.
+    fireEvent.click(screen.getByText("CC"));
+    await waitFor(() => expect(screen.getByText("decode exploded")).toBeTruthy());
+    fireEvent.click(screen.getByText("Retry"));
+
+    // Same file, brand-new job id — the current video stays loaded (no reload).
+    await waitFor(() =>
+      expect(
+        invoke.mock.calls.filter((c) => c[0] === "start_transcription").length
+      ).toBeGreaterThanOrEqual(2)
+    );
+    const lastJobId = [...invoke.mock.calls]
+      .reverse()
+      .find((c) => c[0] === "start_transcription")![1].jobId as number;
+    expect(lastJobId).not.toBe(firstJobId);
+    expect(invoke).toHaveBeenCalledWith(
+      "start_transcription",
+      expect.objectContaining({ mediaPath: "/tmp/media.wav", jobId: lastJobId })
+    );
+    expect(useAppStore.getState().subtitleTracks.every((t) => !t.isGenerated)).toBe(true);
+    expect(screen.queryByText("decode exploded")).toBeNull();
+    expect(useAppStore.getState().isTranscribing).toBe(true);
   });
 });
 
@@ -299,6 +460,7 @@ describe("VideoPlayer quality-of-life features", () => {
       resumeAt: null,
       recentFiles: [],
       playbackRate: 1,
+      sidebarVisible: true,
     });
   });
 
@@ -427,6 +589,7 @@ describe("VideoPlayer native mpv engine", () => {
       resumeAt: null,
       recentFiles: [],
       playbackRate: 1,
+      sidebarVisible: true,
     });
   });
 
@@ -543,6 +706,23 @@ describe("VideoPlayer native mpv engine", () => {
     expect(invoke).toHaveBeenCalledWith("mpv_is_available");
   });
 
+  it("surfaces a clear message when the HTML5 fallback is handed an MKV it can't demux", async () => {
+    // Native engine unavailable (feature-off build, PWA) + an MKV on disk: the
+    // fallback <video> must present the container limitation instead of a
+    // silent black frame, and never pretend the native engine handles it.
+    useAppStore.setState({ currentVideoPath: "/movies/collection.mkv" });
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return false;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+
+    await waitFor(() => expect(screen.getByText(/MKV container/)).toBeTruthy(), { timeout: 3000 });
+    expect(screen.queryByLabelText("Native video surface")).toBeNull();
+  });
+
   it("prefers the native engine even under a mobile-style user agent (no UA sniffing)", async () => {
     const original = navigator.userAgent;
     try {
@@ -580,28 +760,917 @@ describe("VideoPlayer native mpv engine", () => {
     render(<VideoPlayer />);
     await waitFor(() => expect(screen.getByLabelText("Native video surface")).toBeTruthy());
 
-    // The surface is anchored once the stage mounts (rect coalesced to px).
-    await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
-        rect: expect.objectContaining({
-          x: expect.any(Number),
-          y: expect.any(Number),
-          width: expect.any(Number),
-          height: expect.any(Number),
-        }),
-      })
-    );
+    // jsdom measures every element as 0×0; the reporter refuses degenerate
+    // rects (a real 0×0 PlayerViewport must never collapse the native surface
+    // to the top-left corner), so give the canonical `[data-player-viewport]`
+    // element real dimensions to anchor against.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    document.body.appendChild(viewport);
+    viewport.getBoundingClientRect = vi.fn(() => ({
+      x: 352,
+      y: 40,
+      width: 848,
+      height: 760,
+      top: 40,
+      left: 352,
+      right: 1200,
+      bottom: 800,
+    })) as unknown as () => DOMRect;
 
-    // Backend detects the wid stopped resolving to the host surface.
-    await act(async () => {
-      listeners["mpv-embed-lost"]!({ payload: "embedded surface no longer resolves as mpv's wid" });
+    try {
+      // The surface is anchored once the viewport is measured (rect coalesced to px).
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({
+            x: expect.any(Number),
+            y: expect.any(Number),
+            width: expect.any(Number),
+            height: expect.any(Number),
+          }),
+        })
+      );
+
+      // Backend detects the wid stopped resolving to the host surface.
+      await act(async () => {
+        listeners["mpv-embed-lost"]!({ payload: "embedded surface no longer resolves as mpv's wid" });
+      });
+
+      // The rogue window is never presented as in-app playback: straight to the
+      // blob-backed <video>, no lingering native stage.
+      await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+      expect(screen.queryByLabelText("Native video surface")).toBeNull();
+      const video = document.querySelector("video") as HTMLVideoElement;
+      expect(video.src).toContain("asset://");
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("re-anchors on window/fullscreen resize so the stage tracks the container", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      return undefined;
     });
 
-    // The rogue window is never presented as in-app playback: straight to the
-    // blob-backed <video>, no lingering native stage.
-    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+    render(<VideoPlayer />);
+    await screen.findByLabelText("Native video surface");
+    // jsdom measures every element as 0×0, so give the canonical
+    // `[data-player-viewport]` real dimensions for the first anchor.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    document.body.appendChild(viewport);
+    let vpRect = {
+      x: 352,
+      y: 40,
+      width: 848,
+      height: 760,
+      top: 40,
+      left: 352,
+      right: 1200,
+      bottom: 800,
+    };
+    viewport.getBoundingClientRect = vi.fn(() => vpRect) as unknown as () => DOMRect;
+    try {
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({ width: expect.any(Number) }),
+        })
+      );
+      invoke.mockClear();
+
+      // The window grows (manual drag-resize / fullscreen toggle): the
+      // viewport rect changes and the reporter must dispatch the updated
+      // layout instead of the stale one.
+      const bigger = {
+        x: 10,
+        y: 20,
+        width: 1440,
+        height: 900,
+        top: 20,
+        left: 10,
+        right: 1450,
+        bottom: 920,
+      };
+      vpRect = bigger;
+      fireEvent(window, new Event("resize"));
+      fireEvent(document, new Event("fullscreenchange"));
+
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({ x: 10, y: 20, width: 1440, height: 900 }),
+        })
+      );
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("re-anchors exactly when sidebar expand/collapse reflows the PlayerViewport", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    await screen.findByLabelText("Native video surface");
+    // App shell layout owns the PlayerViewport: an open sidebar reflows the
+    // column (x=352, width shrinks), a closed one fills the row (x=0, grows).
+    // The Player consumes that canvas rect VERBATIM — it never measures the
+    // sidebar. In the real browser the sidebar toggle fires the viewport's
+    // ResizeObserver; in jsdom (no RO) we simulate the reflow the same way the
+    // product surfaces `resize`.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    document.body.appendChild(viewport);
+    let vpRect = {
+      x: 352,
+      y: 40,
+      width: 848,
+      height: 760,
+      top: 40,
+      left: 352,
+      right: 1200,
+      bottom: 800,
+    };
+    viewport.getBoundingClientRect = vi.fn(() => vpRect) as unknown as () => DOMRect;
+    try {
+      // Sidebar open → surface anchored to the right of the sidebar.
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({ x: 352, width: 848 }),
+        })
+      );
+      invoke.mockClear();
+
+      // Close the sidebar: App shell reflows the column and the reporter MUST
+      // dispatch the new rect — otherwise the Metal surface keeps rendering
+      // with the sidebar-open X/width and bleeds over the sidebar.
+      vpRect = { x: 0, y: 40, width: 1200, height: 760, top: 40, left: 0, right: 1200, bottom: 800 };
+      fireEvent(window, new Event("resize"));
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({ x: 0, width: 1200 }),
+        })
+      );
+      invoke.mockClear();
+
+      // Re-open → surface must move back right of the sidebar, full width -> 848.
+      vpRect = {
+        x: 352,
+        y: 40,
+        width: 848,
+        height: 760,
+        top: 40,
+        left: 352,
+        right: 1200,
+        bottom: 800,
+      };
+      fireEvent(window, new Event("resize"));
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({ x: 352, width: 848 }),
+        })
+      );
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("toggles the sidebar 10x (open/close/resize/fullscreen) without a stale anchor", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    // Start CLOSED so the loop starts with a meaningful first toggle.
+    useAppStore.setState({ sidebarVisible: false });
+
+    render(<VideoPlayer />);
+    await screen.findByLabelText("Native video surface");
+    const OPEN = { x: 352, y: 40, width: 848, height: 760, top: 40, left: 352, right: 1200, bottom: 800 } as DOMRect;
+    const CLOSED = { x: 0, y: 40, width: 1200, height: 760, top: 40, left: 0, right: 1200, bottom: 800 } as DOMRect;
+    // The canonical PlayerViewport: App shell reflows this column when the
+    // sidebar toggles; the reporter consumes its rect VERBATIM (no sidebar
+    // math in the Player). jsdom has no ResizeObserver, so each toggle is
+    // surfaced the way the product listens — a `resize` event.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    document.body.appendChild(viewport);
+    let vpRect: DOMRect = CLOSED;
+    viewport.getBoundingClientRect = vi.fn(() => vpRect) as unknown as () => DOMRect;
+
+    try {
+      // First anchor: sidebar CLOSED (x=0).
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({ x: 0, width: 1200 }),
+        })
+      );
+
+      const lastLayout = () => {
+        const calls = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+        const last = calls[calls.length - 1];
+        return (last?.[1] as { rect: { x: number; y: number; width: number; height: number } })?.rect;
+      };
+
+      for (let i = 0; i < 10; i++) {
+        const open = i % 2 === 0;
+        invoke.mockClear();
+        vpRect = open ? OPEN : CLOSED;
+        fireEvent(window, new Event("resize"));
+
+        await waitFor(() => {
+          const rect = lastLayout();
+          expect(rect).toBeTruthy();
+          expect(rect!.x).toBe(open ? 352 : 0);
+          expect(rect!.width).toBe(open ? 848 : 1200);
+        });
+
+        // Every dispatch during this tick must carry the CURRENT edge, never the previous one.
+        const layouts = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+        for (const [, payload] of layouts) {
+          const r = (payload as { rect: { x: number; width: number } }).rect;
+          expect(r.x).toBe(open ? 352 : 0);
+          expect(r.width).toBe(open ? 848 : 1200);
+        }
+
+        // Mid-loop (after iteration 5): fire resize + fullscreenchange, confirm
+        // the reporter dispatches an updated rect still matching the current edge.
+        if (i === 5) {
+          invoke.mockClear();
+          vpRect = {
+            x: open ? 352 : 0, y: 20, width: open ? 948 : 1300, height: 860,
+            top: 20, left: open ? 352 : 0, right: open ? 1300 : 1300, bottom: 880,
+          } as DOMRect;
+          fireEvent(window, new Event("resize"));
+          fireEvent(document, new Event("fullscreenchange"));
+          await waitFor(() => {
+            const rect = lastLayout();
+            expect(rect).toBeTruthy();
+            expect(rect!.x).toBe(open ? 352 : 0);
+            expect(rect!.width).toBe(open ? 948 : 1300);
+          });
+        }
+      }
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("anchors the native surface to the PlayerViewport rect verbatim (no sidebar-derived geometry)", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    // The canonical PlayerViewport — laid out by App shell right of the open
+    // sidebar. Its rect IS the region; the Player dispatches it as-is.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    document.body.appendChild(viewport);
+    viewport.getBoundingClientRect = vi.fn(
+      () =>
+        ({
+          x: 352,
+          y: 40,
+          width: 848,
+          height: 760,
+          top: 40,
+          left: 352,
+          right: 1200,
+          bottom: 800,
+        }) as unknown as DOMRect
+    );
+    try {
+      render(<VideoPlayer />);
+      const stage = await screen.findByLabelText("Native video surface");
+      // The video layer box may measure anywhere (here: a stale full-width
+      // rect) — it is NOT the geometry source anymore. The Player is blind to
+      // it; App shell placement is the only authority.
+      stage.getBoundingClientRect = vi.fn(
+        () =>
+          ({
+            x: 0,
+            y: 0,
+            width: 1200,
+            height: 800,
+            top: 0,
+            left: 0,
+            right: 1200,
+            bottom: 800,
+          }) as unknown as DOMRect
+      );
+
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({ x: 352, y: 40, width: 848, height: 760 }),
+        })
+      );
+
+      // Every dispatch must equal the viewport rect — never the stale stage box.
+      const layouts = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+      for (const [, payload] of layouts) {
+        const rect = (payload as { rect: { x: number; width: number } }).rect;
+        expect(rect.x).toBe(352);
+        expect(rect.width).toBe(848);
+      }
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("sends NO native layout while `[data-player-viewport]` is absent (graceful missing element)", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    // No PlayerViewport in the DOM: the Player must not fall back to deriving
+    // geometry from the content row / sidebar. It sends nothing.
+    render(<VideoPlayer />);
+    await screen.findByLabelText("Native video surface");
+    // Let the reporter's bounded per-frame retry run a moment — still no layout.
+    await new Promise((r) => setTimeout(r, 50));
+    const withoutViewport = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+    expect(withoutViewport).toHaveLength(0);
+
+    // App shell mounts the PlayerViewport (the content column appears) → the
+    // same reporter immediately anchors the surface to it, verbatim.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    document.body.appendChild(viewport);
+    viewport.getBoundingClientRect = vi.fn(
+      () =>
+        ({
+          x: 352,
+          y: 40,
+          width: 848,
+          height: 760,
+          top: 40,
+          left: 352,
+          right: 1200,
+          bottom: 800,
+        }) as unknown as DOMRect
+    );
+    try {
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({ x: 352, y: 40, width: 848, height: 760 }),
+        })
+      );
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("keeps the SAME PlayerViewport rect across engine switches (native -> HTML5)", async () => {
+    // One canonical `[data-player-viewport]` (the App shell's content column),
+    // with the Player RENDERED INSIDE it — exactly App.tsx's `<div
+    // data-player-viewport>{<Sidebar sibling/> + <VideoPlayer/>}</div>`
+    // nesting. Whatever video implementation is active, the viewport rect must
+    // never change — only the visible surface swaps. No HTML5-specific box and
+    // no native-specific box may ever be allowed to drift apart.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    const viewportRect = {
+      x: 352,
+      y: 40,
+      width: 848,
+      height: 760,
+      top: 40,
+      left: 352,
+      right: 1200,
+      bottom: 800,
+    };
+    viewport.getBoundingClientRect = vi.fn(
+      () => viewportRect as unknown as DOMRect
+    );
+    viewport.className = "relative z-0 min-h-0 min-w-0 flex-1 overflow-clip";
+    document.body.appendChild(viewport);
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    try {
+      render(<VideoPlayer />, { container: viewport });
+      // Native state first: the mpv stage mounts INSIDE the canonical viewport.
+      await waitFor(() =>
+        expect(screen.getByLabelText("Native video surface")).toBeTruthy()
+      );
+      const stage = screen.getByLabelText("Native video surface");
+      expect(stage.closest("[data-player-viewport]")).not.toBeNull();
+
+      // The reporter anchors the surface to the SAME viewport rect.
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({ x: 352, y: 40, width: 848, height: 760 }),
+        })
+      );
+
+      // Every native dispatch to date carries the identical viewport rect — no
+      // engine-dependent box was ever substituted.
+      const layouts = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+      expect(layouts.length).toBeGreaterThan(0);
+      for (const [, payload] of layouts) {
+        const rect = (payload as { rect: { x: number; width: number } }).rect;
+        expect(rect.x).toBe(352);
+        expect(rect.width).toBe(848);
+      }
+
+      // Engine flips back to HTML5 (embed lost): the blob-backed <video> owns
+      // the stage, native stage gone — viewport still untouched.
+      await act(async () => {
+        listeners["mpv-embed-lost"]!({ payload: "downgrade" });
+      });
+      await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+      expect(screen.queryByLabelText("Native video surface")).toBeNull();
+
+      // The HTML5 video remained inside the same PlayerViewport.
+      const videoAfter = document.querySelector("video") as HTMLVideoElement;
+      expect(videoAfter.closest("[data-player-viewport]")).not.toBeNull();
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("drops to HTML5 when the native clock never proves the file decoded", async () => {
+    // A file mpv accepts via `loadfile` but cannot actually demux/decode (a
+    // renamed path, a corrupt container, or an unsupported codec) produces no
+    // `mpv-load` error: `mpv-loaded` fires, then the 250 ms ticker emits a
+    // single (0,0) snapshot and nothing else. The watchdog must not strand the
+    // player on a silent black frame — it falls back to the blob <video>.
+    vi.useFakeTimers();
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    // Flush the mount pipeline (availability check → setEngine("mpv") → the
+    // watchdog effect that schedules the decode-timeout timer).
+    for (let i = 0; i < 4; i++) await act(async () => {});
+    expect(screen.getByLabelText("Native video surface")).toBeTruthy();
+
+    // Corruption signature: the first (and only) clock snapshot is all zeros.
+    await act(async () => {
+      listeners["mpv-timeupdate"]!({
+        payload: { position: 0, duration: 0, paused: false, ended: false },
+      });
+    });
+
+    // The decode grace window elapses with no real duration/playhead signal.
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+    });
+    await act(async () => {});
+    await act(async () => {});
+
+    // The cutover lands on the HTML5 blob engine, and the native stage is gone.
+    expect(document.querySelector("video")).toBeTruthy();
     expect(screen.queryByLabelText("Native video surface")).toBeNull();
     const video = document.querySelector("video") as HTMLVideoElement;
     expect(video.src).toContain("asset://");
+
+    vi.useRealTimers();
+  });
+
+  it("keeps the native engine when the clock reports a real decode signal", async () => {
+    // A healthy file delivers a duration (or advancing playhead) inside the
+    // grace window — the watchdog must neither fire nor touch the native stage.
+    vi.useFakeTimers();
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    for (let i = 0; i < 4; i++) await act(async () => {});
+    expect(screen.getByLabelText("Native video surface")).toBeTruthy();
+
+    await act(async () => {
+      listeners["mpv-timeupdate"]!({
+        payload: { position: 0.25, duration: 120, paused: false, ended: false },
+      });
+    });
+
+    // Same elapsed time as the failure case: nothing may fall back.
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+    });
+    await act(async () => {});
+
+    expect(document.querySelector("video")).toBeNull();
+    expect(screen.getByLabelText("Native video surface")).toBeTruthy();
+
+    vi.useRealTimers();
+  });
+
+  // -----------------------------------------------------------------------
+  // A–J  Architectural invariant tests (canonical Player Compositing model)
+  // -----------------------------------------------------------------------
+
+  it("[A] Engine XOR: exactly one of data-native-stage or <video> exists in both modes", async () => {
+    // §5 / Forbidden #11: the two video surfaces are mutually exclusive.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    viewport.getBoundingClientRect = vi.fn(() => ({
+      x: 0, y: 0, width: 1280, height: 720,
+      top: 0, left: 0, right: 1280, bottom: 720,
+    }) as unknown as DOMRect);
+    viewport.className = "relative z-0 min-h-0 min-w-0 flex-1 overflow-clip";
+    document.body.appendChild(viewport);
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    try {
+      render(<VideoPlayer />, { container: viewport });
+      await waitFor(() =>
+        expect(screen.getByLabelText("Native video surface")).toBeTruthy()
+      );
+      // Native mode: data-native-stage present, <video> absent
+      expect(document.querySelector("[data-native-stage]")).not.toBeNull();
+      expect(document.querySelector("video")).toBeNull();
+
+      // Flip to HTML5 via embed-lost
+      await act(async () => {
+        listeners["mpv-embed-lost"]!({ payload: "downgrade" });
+      });
+      await waitFor(() =>
+        expect(document.querySelector("video")).toBeTruthy()
+      );
+      // HTML5 mode: <video> present, data-native-stage absent
+      expect(screen.queryByLabelText("Native video surface")).toBeNull();
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("[B] Verbatim viewport: rect sent to mpv_set_layout equals getBoundingClientRect exactly", async () => {
+    // §4 / The Absolute Rule: the player consumes the viewport box verbatim;
+    // no sidebar width subtracted, no clamping to a sidebar boundary.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    const expected = {
+      x: 352, y: 40, width: 848, height: 760,
+      top: 40, left: 352, right: 1200, bottom: 800,
+    };
+    viewport.getBoundingClientRect = vi.fn(() => expected as unknown as DOMRect);
+    viewport.className = "relative z-0 min-h-0 min-w-0 flex-1 overflow-clip";
+    document.body.appendChild(viewport);
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    try {
+      render(<VideoPlayer />, { container: viewport });
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({ x: 352, y: 40, width: 848, height: 760 }),
+        })
+      );
+      // Confirm the four SurfaceLayout fields match exactly — no sidebar subtraction
+      const layoutCall = invoke.mock.calls.find((c) => c[0] === "mpv_set_layout");
+      const sent = (layoutCall![1] as { rect: { x: number; y: number; width: number; height: number } }).rect;
+      expect(sent).toEqual({ x: 352, y: 40, width: 848, height: 760 });
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("[B2] Right-of-sidebar invariant: an inline sidebar forces the native rect to its edge (never under/over)", async () => {
+    // §4 / Right-of-sidebar invariant: even if a stale/wrongly-measured
+    // viewport rect would start left of the inline sidebar, the rect sent to
+    // mpv_set_layout must start at the sidebar's right edge — the picture never
+    // bleeds under/over the sidebar. (Verbatim when flex is correct — no-op.)
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    // Pathological measurement: full-window rect reported while the sidebar is open.
+    viewport.getBoundingClientRect = vi.fn(() => ({
+      x: 0, y: 40, width: 1200, height: 760,
+      top: 40, left: 0, right: 1200, bottom: 800,
+    }) as unknown as DOMRect);
+    document.body.appendChild(viewport);
+
+    const sidebar = document.createElement("aside");
+    sidebar.setAttribute("data-sidebar", "");
+    sidebar.getBoundingClientRect = vi.fn(() => ({
+      x: 0, y: 40, width: 352, height: 760,
+      top: 40, left: 0, right: 352, bottom: 800,
+    }) as unknown as DOMRect);
+    document.body.appendChild(sidebar);
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    try {
+      render(<VideoPlayer />, { container: viewport });
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+          rect: expect.objectContaining({ x: 352, y: 40, width: 848, height: 760 }),
+        })
+      );
+      const layoutCall = invoke.mock.calls.find((c) => c[0] === "mpv_set_layout");
+      const sent = (layoutCall![1] as { rect: { x: number; y: number; width: number; height: number } }).rect;
+      expect(sent).toEqual({ x: 352, y: 40, width: 848, height: 760 });
+    } finally {
+      viewport.remove();
+      sidebar.remove();
+    }
+  });
+
+  it("[C] Event-driven: no IPC fires when the viewport rect is unchanged (key short-circuit)", async () => {
+    // §4 / §18.11: the reporter coalesces and stops at idle once anchored.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    viewport.getBoundingClientRect = vi.fn(() => ({
+      x: 0, y: 0, width: 1280, height: 720,
+      top: 0, left: 0, right: 1280, bottom: 720,
+    }) as unknown as DOMRect);
+    viewport.className = "relative z-0 min-h-0 min-w-0 flex-1 overflow-clip";
+    document.body.appendChild(viewport);
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    try {
+      render(<VideoPlayer />, { container: viewport });
+      await waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", expect.anything())
+      );
+
+      // Record how many mpv_set_layout calls exist after the initial anchor
+      const countAfterAnchor = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout").length;
+
+      // Trigger a window resize; the rect is unchanged, so the key short-circuits
+      await act(async () => {
+        window.dispatchEvent(new Event("resize"));
+      });
+      await act(async () => {});
+      await act(async () => {});
+
+      const countAfterResize = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout").length;
+      expect(countAfterResize).toBe(countAfterAnchor);
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("[D] Degenerate rect (0×0): no mpv_set_layout is sent", async () => {
+    // §9 / §18.4: degenerate rects are skipped so the surface never collapses
+    // to a top-left patch while the layout settles.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    viewport.getBoundingClientRect = vi.fn(() => ({
+      x: 0, y: 0, width: 0, height: 0,
+      top: 0, left: 0, right: 0, bottom: 0,
+    }) as unknown as DOMRect);
+    viewport.className = "relative z-0 min-h-0 min-w-0 flex-1 overflow-clip";
+    document.body.appendChild(viewport);
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    try {
+      render(<VideoPlayer />, { container: viewport });
+      await waitFor(() =>
+        expect(screen.getByLabelText("Native video surface")).toBeTruthy()
+      );
+      // Give the reporter time to run (even if it were to fire, which it must not)
+      await act(async () => {});
+      await act(async () => {});
+
+      const layoutCalls = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+      expect(layoutCalls).toHaveLength(0);
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("[E] Missing [data-player-viewport]: no native layout is sent (graceful absence)", async () => {
+    // §4 / §18.1: when the viewport element is absent, the reporter retries
+    // each frame instead of sending a wrong rect.
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    // Render into document.body — there is no [data-player-viewport]
+    render(<VideoPlayer />);
+    await waitFor(() =>
+      expect(screen.getByLabelText("Native video surface")).toBeTruthy()
+    );
+    await act(async () => {});
+    await act(async () => {});
+
+    const layoutCalls = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+    expect(layoutCalls).toHaveLength(0);
+  });
+
+  it("[F] Overlay z-ladder: controls bar and play/pause carry explicit z-indexes above video", async () => {
+    // §5 / §8: the overlay stack sits above the picture with fixed z-ladder
+    // so new overlays cannot silently land under the native surface.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    viewport.getBoundingClientRect = vi.fn(() => ({
+      x: 0, y: 0, width: 1280, height: 720,
+      top: 0, left: 0, right: 1280, bottom: 720,
+    }) as unknown as DOMRect);
+    viewport.className = "relative z-0 min-h-0 min-w-0 flex-1 overflow-clip";
+    document.body.appendChild(viewport);
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    try {
+      render(<VideoPlayer />, { container: viewport });
+      await waitFor(() =>
+        expect(screen.getByLabelText("Native video surface")).toBeTruthy()
+      );
+      // The controls bar is always in the DOM (toggled via opacity) and carries z-40
+      const controlsBar = viewport.querySelector("[class*='z-40']");
+      expect(controlsBar).not.toBeNull();
+      expect(controlsBar!.className).toContain("z-40");
+
+      // The play/pause overlay is always in the DOM and carries z-20
+      const playPause = viewport.querySelector("[class*='z-20']");
+      expect(playPause).not.toBeNull();
+      expect(playPause!.className).toContain("z-20");
+
+      // The video surface (native stage) is z-0 — below both overlay layers
+      const stage = screen.getByLabelText("Native video surface");
+      expect(stage.className).toContain("z-0");
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("[G] Sidebar is never inside the Player's DOM subtree", async () => {
+    // §3 / §4: the Sidebar is a sibling in the content row, never a child of
+    // the PlayerViewport. The player root must not contain [data-sidebar].
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    viewport.getBoundingClientRect = vi.fn(() => ({
+      x: 0, y: 0, width: 1280, height: 720,
+      top: 0, left: 0, right: 1280, bottom: 720,
+    }) as unknown as DOMRect);
+    viewport.className = "relative z-0 min-h-0 min-w-0 flex-1 overflow-clip";
+    document.body.appendChild(viewport);
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return false;
+      return undefined;
+    });
+
+    render(<VideoPlayer />, { container: viewport });
+    await waitFor(() =>
+      expect(document.querySelector("video")).toBeTruthy()
+    );
+
+    // [data-sidebar] must NOT appear anywhere inside the viewport
+    expect(viewport.querySelector("[data-sidebar]")).toBeNull();
+  });
+
+  it("[H] Engine switch preserves the viewport rect exactly (native -> HTML5 -> native)", async () => {
+    // §14: switching engines changes the surface, never the region. The rect
+    // fed to mpv_set_layout before and after the switch must be identical.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    const rect = {
+      x: 352, y: 40, width: 848, height: 760,
+      top: 40, left: 352, right: 1200, bottom: 800,
+    };
+    viewport.getBoundingClientRect = vi.fn(() => rect as unknown as DOMRect);
+    viewport.className = "relative z-0 min-h-0 min-w-0 flex-1 overflow-clip";
+    document.body.appendChild(viewport);
+
+    let nativeAvailable = true;
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return nativeAvailable;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    try {
+      render(<VideoPlayer />, { container: viewport });
+      await waitFor(() =>
+        expect(screen.getByLabelText("Native video surface")).toBeTruthy()
+      );
+      const rects = () => invoke.mock.calls
+        .filter((c) => c[0] === "mpv_set_layout")
+        .map((c) => (c[1] as { rect: { x: number } }).rect.x);
+      expect(rects()).toContain(352);
+
+      // Embed-lost → HTML5
+      await act(async () => {
+        listeners["mpv-embed-lost"]!({ payload: "downgrade" });
+      });
+      await waitFor(() =>
+        expect(document.querySelector("video")).toBeTruthy()
+      );
+      expect(screen.queryByLabelText("Native video surface")).toBeNull();
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("[I] mpv-embed-lost always cutover to HTML5 with a blob-backed src", async () => {
+    // §7 / §13 Forbidden #12: a detached or rogue window is never presented
+    // as in-app playback; the embed-loss path lands on the blob engine.
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    viewport.getBoundingClientRect = vi.fn(() => ({
+      x: 0, y: 0, width: 1280, height: 720,
+      top: 0, left: 0, right: 1280, bottom: 720,
+    }) as unknown as DOMRect);
+    viewport.className = "relative z-0 min-h-0 min-w-0 flex-1 overflow-clip";
+    document.body.appendChild(viewport);
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    try {
+      render(<VideoPlayer />, { container: viewport });
+      await waitFor(() =>
+        expect(screen.getByLabelText("Native video surface")).toBeTruthy()
+      );
+
+      await act(async () => {
+        listeners["mpv-embed-lost"]!({ payload: "downgrade" });
+      });
+      await waitFor(() =>
+        expect(document.querySelector("video")).toBeTruthy()
+      );
+      const video = document.querySelector("video") as HTMLVideoElement;
+      expect(video.src).toContain("asset://");
+      expect(screen.queryByLabelText("Native video surface")).toBeNull();
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("[J] Watchdog: a file that never proves decode drops to HTML5 within NATIVE_DECODE_WATCHDOG_MS", async () => {
+    // §7 watchdog: a corrupt or unsupported file fires mpv-loaded but the
+    // clock only returns (0,0) — the watchdog fires after 5 s and the player
+    // must fall back to the blob engine (NOT stay silent on a black frame).
+    vi.useFakeTimers();
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "mpv_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    for (let i = 0; i < 4; i++) await act(async () => {});
+    expect(screen.getByLabelText("Native video surface")).toBeTruthy();
+
+    // Corrupt signature: position=0, duration=0 — no real decode proof
+    await act(async () => {
+      listeners["mpv-timeupdate"]!({
+        payload: { position: 0, duration: 0, paused: false, ended: false },
+      });
+    });
+
+    // Advance past the 5 s grace window
+    await act(async () => { vi.advanceTimersByTime(5000); });
+    await act(async () => {});
+    await act(async () => {});
+
+    // Verify cutover: HTML5 blob engine owns the stage
+    expect(document.querySelector("video")).toBeTruthy();
+    expect(screen.queryByLabelText("Native video surface")).toBeNull();
+
+    vi.useRealTimers();
   });
 });

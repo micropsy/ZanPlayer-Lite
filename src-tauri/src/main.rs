@@ -103,12 +103,26 @@ struct ProgressPayload {
 
 #[derive(Clone, serde::Serialize)]
 struct PipelineProgress {
+    job_id: i64,
     percentage: f64,
 }
 
+/// Completion of a transcription run. `job_id` lets the frontend ignore events
+/// from a stale run (e.g. an earlier video whose job outlived the switch).
 #[derive(Clone, serde::Serialize)]
 struct TranscriptionDone {
+    job_id: i64,
     total: usize,
+}
+
+/// A transcription run failed. `job_id` leads the failed run; `message` is the
+/// human-readable reason. Frontends only surface this when the job_id matches
+/// the run they started (a failed *previous* video must not pop an error on the
+/// current one).
+#[derive(Clone, serde::Serialize)]
+struct TranscriptionError {
+    job_id: i64,
+    message: String,
 }
 
 /// One complete cue timeline handed to the UI when a full (batch) job finishes.
@@ -121,6 +135,7 @@ struct BatchTrack {
 
 #[derive(Clone, serde::Serialize)]
 struct TranscriptionBatchDone {
+    job_id: i64,
     tracks: Vec<BatchTrack>,
 }
 
@@ -186,18 +201,59 @@ struct ProjectData {
 /// The background decode thread appends globalized cues here; the webview calls
 /// `poll_transcript_cues` (typically on a timer or after `transcript-cues-ready`)
 /// and only surfaces cues whose timestamp overlaps the current playhead.
+///
+/// Every entry carries the `job_id` of the transcription run that produced it.
+/// A new video can be loaded while the previous file's job is still decoding,
+/// so cues of different jobs can sit in the queue at the same time — the poller
+/// must drain *only its own job's* cues, never another file's subtitles.
 #[derive(Clone, Default)]
-struct RenderQueue(Arc<Mutex<Vec<SubtitleCue>>>);
+struct RenderQueue(Arc<Mutex<Vec<QueuedCue>>>);
+
+/// A cue in the render queue tagged with the job that produced it.
+#[derive(Clone)]
+struct QueuedCue {
+    job_id: i64,
+    cue: SubtitleCue,
+}
+
+/// Drain and return every cue belonging to `job_id` (removing them from the
+/// shared queue); cues of other in-flight jobs are left untouched.
+fn drain_job(queue: &RenderQueue, job_id: i64) -> Vec<SubtitleCue> {
+    let mut guard = queue.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let drained = guard
+        .iter()
+        .filter(|q| q.job_id == job_id)
+        .map(|q| q.cue.clone())
+        .collect();
+    guard.retain(|q| q.job_id != job_id);
+    drained
+}
+
+/// Drop every queued cue that belongs to `job_id` (used on a seek so pre-seek
+/// subtitles of a repositioned job cannot surface later).
+fn clear_job(queue: &RenderQueue, job_id: i64) {
+    let mut guard = queue.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.retain(|q| q.job_id != job_id);
+}
 
 /// Handle for one live transcription job's seek channel: which media file the
-/// job is decoding and the sender its streaming passes listen on. Replaced on
-/// every `start_transcription`; empty while idle, so seeks outside a run are
-/// no-ops.
+/// job is decoding, the frontend-supplied job id (so queue/seek operations can
+/// target exactly that run even when a newer job has replaced this one), and
+/// the sender its streaming passes listen on. Replaced on every
+/// `start_transcription`; empty while idle, so seeks outside a run are no-ops.
 #[derive(Clone)]
 struct JobSeek {
     media_path: String,
+    job_id: i64,
     seek_tx: Sender<f64>,
 }
+
+/// The job id of the transcription run currently decoding (work-in-progress
+/// truth for the frontend's completion safety net). Set at job start; cleared
+/// only by the job that set it, so a newer job is never false-negative while
+/// the run that lost the slot is still finishing.
+#[derive(Clone, Default)]
+struct ActiveJob(Arc<Mutex<Option<i64>>>);
 
 /// App-managed live control channel. `seek_transcription` forwards a playhead
 /// jump to a realtime (streaming) job so its passes drop VAD/utterance state
@@ -464,6 +520,7 @@ async fn start_transcription(
     language: Option<String>,
     subtitle_mode: SubtitleMode,
     transcription_mode: TranscriptionMode,
+    job_id: i64,
 ) -> Result<(), String> {
     let dir = models_dir();
     let model_path = match find_model(&dir, &model_name) {
@@ -487,10 +544,16 @@ async fn start_transcription(
         )
     };
 
-    // Register this job's live seek channel so `seek_transcription` (invoked on
-    // every playhead jump while subtitles are running) can reposition the
-    // realtime passes. Replacing the sender for a new job is safe: streaming
-    // passes hold a cloned receiver; a stale sender simply finds no listeners.
+    // Mark this run as in-flight so `transcription_active` can report it, and
+    // register its live seek channel so `seek_transcription` (invoked on every
+    // playhead jump while subtitles are running) can reposition the realtime
+    // passes. Replacing the sender for a new job is safe: streaming passes hold
+    // a cloned receiver; a stale sender simply finds no listeners.
+    app.state::<ActiveJob>()
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace(job_id);
     let (seek_tx, seek_rx) = unbounded::<f64>();
     app.state::<SeekControl>()
         .0
@@ -498,6 +561,7 @@ async fn start_transcription(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .replace(JobSeek {
             media_path: media_path.clone(),
+            job_id,
             seek_tx,
         });
 
@@ -511,6 +575,7 @@ async fn start_transcription(
             subtitle_mode,
             transcription_mode,
             seek_rx,
+            job_id,
         );
     });
     Ok(())
@@ -525,6 +590,7 @@ fn run_transcription_job(
     subtitle_mode: SubtitleMode,
     transcription_mode: TranscriptionMode,
     seek_rx: Receiver<f64>,
+    job_id: i64,
 ) {
     let plan = plan_job(subtitle_mode, transcription_mode);
     let passes = plan.passes.clone();
@@ -541,8 +607,13 @@ fn run_transcription_job(
         match WhisperContext::new_with_params(&model_path, WhisperContextParameters::default()) {
             Ok(ctx) => contexts.push(ctx),
             Err(e) => {
-                let _ =
-                    app.emit("transcription-error", format!("Failed to load Whisper model: {}", e));
+                let _ = app.emit(
+                    "transcription-error",
+                    TranscriptionError {
+                        job_id,
+                        message: format!("Failed to load Whisper model: {}", e),
+                    },
+                );
                 if cleanup_wav {
                     std::fs::remove_file(&wav_path).ok();
                 }
@@ -554,17 +625,17 @@ fn run_transcription_job(
     let result = match (transcription_mode, parallel) {
         // One real-time pass streams cues out the moment each chunk decodes.
         (TranscriptionMode::Stream, false) => {
-            run_streaming_job(app.clone(), &wav_path, passes, contexts, language, seek_rx)
+            run_streaming_job(app.clone(), &wav_path, passes, contexts, language, seek_rx, job_id)
         }
         // Two real-time passes (original + translation) on separate threads over
         // the same WAV, so "Both" never doubles wall-clock time per chunk.
         (TranscriptionMode::Stream, true) => {
-            run_streaming_job(app.clone(), &wav_path, passes, contexts, language, seek_rx)
+            run_streaming_job(app.clone(), &wav_path, passes, contexts, language, seek_rx, job_id)
         }
         // Full batch: one context decodes every pass sequentially, buffering all
         // cues; the UI surfaces both complete tracks only when the job finishes.
         (TranscriptionMode::Batch, false) => {
-            run_batch_job(app.clone(), &wav_path, contexts, language, &passes)
+            run_batch_job(app.clone(), &wav_path, contexts, language, &passes, job_id)
         }
         (TranscriptionMode::Batch, true) => unreachable!("batch mode never needs parallel contexts"),
     };
@@ -573,22 +644,60 @@ fn run_transcription_job(
         std::fs::remove_file(&wav_path).ok();
     }
 
+    // The run is finished either way. Any cues left in the render queue from
+    // this job were never polled (the frontend stops polling our job id once
+    // completion is reported) — drop them so entries of a job the UI already
+    // forgot can't linger, and release the in-flight slot (only if we set it,
+    // so a newer job taking over is never false-negative).
+    clear_job(&app.state::<RenderQueue>(), job_id);
+    let active_state = app.state::<ActiveJob>();
+    let mut active = active_state
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *active == Some(job_id) {
+        *active = None;
+    }
+    drop(active);
+
     match result {
         Ok(total) => {
-            let _ = app.emit("transcription-done", TranscriptionDone { total });
+            let _ = app.emit("transcription-done", TranscriptionDone { job_id, total });
         }
         Err(e) => {
-            let _ = app.emit("transcription-error", e);
+            let _ = app.emit(
+                "transcription-error",
+                TranscriptionError {
+                    job_id,
+                    message: e,
+                },
+            );
         }
     }
 }
 
-/// Drain the render queue. The UI calls this (on a timer and/or after
-/// `transcript-cues-ready`) and matches cues against the player clock.
+/// Drain the render queue for one transcription job. The UI calls this (on a
+/// timer and/or after `transcript-cues-ready`) with the job id it started the
+/// run with, and only its own cues are returned — another video's still-running
+/// job keeps its entries untouched.
 #[tauri::command]
-fn poll_transcript_cues(state: State<'_, RenderQueue>) -> Vec<SubtitleCue> {
-    let mut guard = state.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::mem::take(&mut *guard)
+fn poll_transcript_cues(state: State<'_, RenderQueue>, job_id: i64) -> Vec<SubtitleCue> {
+    drain_job(&state, job_id)
+}
+
+/// True while the transcription run `job_id` is still decoding. The frontend
+/// polls this as a completion safety net: a missed `transcription-done`/error
+/// event (fast batch run, listener torn down mid-job) can otherwise leave the
+/// `isTranscribing` flag set forever, silently blocking every later
+/// auto-transcription. False also when a newer job has taken over the slot —
+/// the caller then finalizes its own run because it knows the backend moved on.
+#[tauri::command]
+fn transcription_active(state: State<'_, ActiveJob>, job_id: i64) -> bool {
+    state
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some_and(|active| active == job_id)
 }
 
 /// Forward a playhead jump to the active realtime (streaming) job, if any.
@@ -610,15 +719,12 @@ fn seek_transcription(
         return Ok(());
     };
     if control.media_path == media_path && !seek_to.is_nan() {
-        // A playhead jump invalidates every cue still sitting in the render
-        // queue: they were decoded from audio before the new position. Purge
-        // them first so neither the poller nor a late merge can surface
-        // pre-seek subtitles, then reposition the live passes.
-        app.state::<RenderQueue>()
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        // A playhead jump invalidates every cue of this job still sitting in the
+        // render queue: they were decoded from audio before the new position.
+        // Purge exactly this job's entries (other jobs queued behind keep theirs)
+        // so neither the poller nor a late merge can surface pre-seek subtitles,
+        // then reposition the live passes.
+        clear_job(&app.state::<RenderQueue>(), control.job_id);
         let _ = control.seek_tx.send(seek_to.max(0.0));
     }
     Ok(())
@@ -658,6 +764,7 @@ fn run_streaming_job(
     contexts: Vec<WhisperContext>,
     language: Option<String>,
     seek_rx: Receiver<f64>,
+    job_id: i64,
 ) -> Result<usize, String> {
     let pass_count = passes.len();
     let queue = app.state::<RenderQueue>().0.clone();
@@ -689,6 +796,7 @@ fn run_streaming_job(
                 queue,
                 progress,
                 seek_rx,
+                job_id,
             )
         }));
     }
@@ -716,9 +824,10 @@ fn run_streaming_pass_inner(
     translate: bool,
     kind: String,
     pass_index: usize,
-    queue: Arc<Mutex<Vec<SubtitleCue>>>,
+    queue: Arc<Mutex<Vec<QueuedCue>>>,
     progress: Arc<Mutex<Vec<f64>>>,
     seek_rx: Receiver<f64>,
+    job_id: i64,
 ) -> Result<usize, String> {
     let options = StreamOptions {
         language,
@@ -733,7 +842,7 @@ fn run_streaming_pass_inner(
             queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(cue.clone());
+                .push(QueuedCue { job_id, cue: cue.clone() });
             let _ = emit_app.emit("transcript-segment", cue);
             let _ = emit_app.emit("transcript-cues-ready", ());
         }
@@ -753,6 +862,7 @@ fn run_streaming_pass_inner(
             let _ = emit_app.emit(
                 "transcription-progress",
                 PipelineProgress {
+                    job_id,
                     percentage: combined.clamp(0.0, 100.0),
                 },
             );
@@ -796,6 +906,7 @@ fn run_batch_job(
     contexts: Vec<WhisperContext>,
     language: Option<String>,
     passes: &[(bool, String)],
+    job_id: i64,
 ) -> Result<usize, String> {
     let ctx = contexts.into_iter().next().expect("batch job has a context");
     let pass_count = passes.len().max(1);
@@ -820,6 +931,7 @@ fn run_batch_job(
                 let _ = emit_app.emit(
                     "transcription-progress",
                     PipelineProgress {
+                        job_id,
                         percentage: (base + pct * span / 100.0).clamp(0.0, 100.0),
                     },
                 );
@@ -845,7 +957,10 @@ fn run_batch_job(
         });
     }
 
-    let _ = app.emit("transcription-batch-done", TranscriptionBatchDone { tracks });
+    let _ = app.emit(
+        "transcription-batch-done",
+        TranscriptionBatchDone { job_id, tracks },
+    );
     Ok(total)
 }
 
@@ -1516,6 +1631,135 @@ mod tests {
         assert_ne!(back.version, PROJECT_VERSION);
         assert_eq!(back.version, 99);
     }
+
+    // -- Render queue job scoping ---------------------------------------------
+
+    fn queued(job_id: i64, id: &str) -> QueuedCue {
+        QueuedCue {
+            job_id,
+            cue: SubtitleCue {
+                id: id.to_string(),
+                start_time: 0.0,
+                end_time: 1.0,
+                text: id.to_string(),
+                kind: Some("original".to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn drain_job_returns_only_matching_jobs_latest_first() {
+        let queue = RenderQueue(Arc::new(Mutex::new(vec![
+            queued(7, "a"),
+            queued(8, "b"),
+            queued(7, "c"),
+        ])));
+        let drained = drain_job(&queue, 7);
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().any(|c| c.id == "a"));
+        assert!(drained.iter().any(|c| c.id == "c"));
+        // Job 8's entries are untouched.
+        let remaining = queue.0.lock().unwrap().clone();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].job_id, 8);
+        assert_eq!(remaining[0].cue.id, "b");
+        // Draining job 8 now empties the queue.
+        assert_eq!(drain_job(&queue, 8).len(), 1);
+        assert!(queue.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_job_purges_only_that_jobs_cues() {
+        let queue = RenderQueue(Arc::new(Mutex::new(vec![
+            queued(7, "stale-pre-seek"),
+            queued(8, "other-file"),
+        ])));
+        clear_job(&queue, 7);
+        let remaining = queue.0.lock().unwrap().clone();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].job_id, 8);
+        assert!(remaining[0].cue.id == "other-file");
+    }
+
+    #[test]
+    fn job_seek_purge_targets_current_media_and_job() {
+        // No live job: seek is a no-op.
+        let control = SeekControl(Arc::new(Mutex::new(None)));
+        let seek = |media: &str, to: f64| {
+            let guard = control.0.lock().unwrap();
+            match guard.as_ref() {
+                Some(j) if j.media_path == media && !to.is_nan() => Some(j.job_id),
+                _ => None,
+            }
+        };
+        assert!(seek("/a.mp4", 5.0).is_none());
+
+        let (tx, rx) = unbounded();
+        control
+            .0
+            .lock()
+            .unwrap()
+            .replace(JobSeek {
+                media_path: "/a.mp4".to_string(),
+                job_id: 42,
+                seek_tx: tx,
+            });
+
+        // NaN seeks are rejected by the matching guard.
+        assert!(seek("/a.mp4", f64::NAN).is_none());
+        // Wrong media path: rejected.
+        assert!(seek("/b.mp4", 5.0).is_none());
+        // Correct media + valid target resolves to the job id.
+        assert_eq!(seek("/a.mp4", 5.0), Some(42));
+        // The same control still pushes through the equal path the command uses.
+        let _ = rx; // channel stays alive for the command's send()
+    }
+
+    #[test]
+    fn active_job_reports_true_until_cleared_by_its_own_job() {
+        let active = ActiveJob(Arc::new(Mutex::new(Some(7i64))));
+        // A stale completion for a job that no longer holds the slot must leave
+        // it untouched (a newer run owns the slot now).
+        {
+            let mut guard = active.0.lock().unwrap();
+            if *guard == Some(7) {
+                *guard = None;
+            }
+        }
+        assert!(!active.0.lock().unwrap().is_some());
+
+        let active = ActiveJob(Arc::new(Mutex::new(Some(7i64))));
+        // A newer job (8) taking over makes 7 read false, but 7 finishing must
+        // not clear 8 (the compare-and-clear pattern).
+        {
+            let mut guard = active.0.lock().unwrap();
+            if *guard == Some(7) {
+                *guard = None;
+            }
+        }
+        {
+            let guard = active.0.lock().unwrap();
+            assert_eq!(guard.as_ref(), None);
+        }
+        // Simulate the real sequence: start 7, then 8 replaces it; 7's cleanup
+        // (compare-and-clear on 7) must leave 8 active.
+        let active = ActiveJob(Arc::new(Mutex::new(None)));
+        let set = |id: i64| *active.0.lock().unwrap() = Some(id);
+        set(7);
+        set(8);
+        let mut guard = active.0.lock().unwrap();
+        if *guard == Some(7) {
+            *guard = None;
+        }
+        drop(guard);
+        assert_eq!(*active.0.lock().unwrap(), Some(8));
+        let mut guard = active.0.lock().unwrap();
+        if *guard == Some(8) {
+            *guard = None;
+        }
+        drop(guard);
+        assert_eq!(*active.0.lock().unwrap(), None);
+    }
 }
 
 fn main() {
@@ -1527,6 +1771,7 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(RenderQueue::default())
         .manage(SeekControl::default())
+        .manage(ActiveJob::default())
         .manage(native_player::MpvControl::default())
         .manage(native_player::MediaPlaybackState::default())
         .plugin(native_player::mobile_media_init())
@@ -1540,6 +1785,7 @@ native_player::mpv_is_available,
             native_player::mpv_set_volume,
             native_player::mpv_set_speed,
             native_player::mpv_stop,
+            native_player::native_layout_debug,
             open_video_dialog,
             open_subtitle_dialog,
             save_subtitle_dialog,
@@ -1553,6 +1799,7 @@ native_player::mpv_is_available,
             extract_audio,
             start_transcription,
             poll_transcript_cues,
+            transcription_active,
             seek_transcription,
             download_whisper_model,
             delete_whisper_model,

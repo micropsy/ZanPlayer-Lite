@@ -201,13 +201,41 @@ seeks through one native funnel, and signals `mpv-embed-lost` to drop back to
 HTML5 when the surface is lost. Shipped desktop builds are feature-off (HTML5);
 see `AGENTS.md` for the engine notes.
 
-**Codec support is per-backend and, outside the HTML5 path, unverified.** The
-file picker, drag-and-drop, native backends and HTML5 fallback all share one
-centralized format catalog (`src/common/mediaFormats.ts`), but which of those
-formats actually *decodes* depends on the underlying engine (browser codecs,
-libmpv builds, Media3, AVFoundation). No test media has yet been run through
-the native engines on any device — do not assume universal codec support until
-the compatibility matrix in `Todo.md` is filled in per platform.
+**Codec support is per-backend.** The file picker, drag-and-drop, native
+backends and HTML5 fallback all share one centralized format catalog
+(`src/common/mediaFormats.ts`), but which of those formats actually *decodes*
+depends on the underlying engine (browser codecs, libmpv builds, Media3,
+AVFoundation). The macOS Render-API engine (libmpv) passes its 13-check
+interactive smoke battery with real **MP4/H.264/AAC and MKV/H.264** files
+(render context, Metal frame presentation, decode, clock, transparency,
+plus stage re-anchoring through sidebar reflow, multi-step manual resize, and
+native + web fullscreen). A broader decode corpus was verified against the
+Homebrew libmpv 0.41 build the app links (generated with the bundled FFmpeg
+9.0; every entry decoded, i.e. produced frames without error):
+
+| Container/Codec | Native (libmpv) | HTML5 (<video>) |
+|---|---|---|
+| MP4 / H.264 + AAC | ✅ | ✅ (Safari/Chromium) |
+| MOV / H.265 | ✅ | ✅ (Safari/Chromium) |
+| WebM / VP8 | ✅ | ✅ (Safari/Chromium) |
+| WebM / VP9 | ✅ | ✅ (Safari/Chromium) |
+| MKV / H.264 | ✅ | ⚠️ Chromium subset; ❌ WebKit |
+| MKV / H.265 | ✅ | ⚠️ Chromium subset; ❌ WebKit |
+| AVI / MPEG-4 | ✅ | ❌ |
+| WMV / WMV2 | ✅ | ❌ |
+| FLV / FLV1 | ✅ | ❌ |
+| MP3, WAV, OGG, FLAC, M4A/AAC, raw AAC | ✅ | ✅ |
+| WMA | ✅ | ❌ |
+| Corrupt/undecodable file | ⏱️ watchdog → HTML5 fallback | error overlay |
+
+A file mpv accepts via `loadfile` but cannot actually demux/decode (renamed
+path, corrupt container, unsupported codec) no longer strands the player on a
+silent black frame: a 5 s decode watchdog (`VideoPlayer.tsx`) cuts back to the
+HTML5 blob engine when the native clock never reports a real duration/playhead,
+whose own failure then surfaces the visible hint overlay. Everything
+else — Windows/Linux native engines, Android/iOS, and the browser-codec matrix —
+is unverified; do not assume universal codec support until the compatibility
+matrix in `Todo.md` is filled in per platform.
 
 ### Mobile status (honest)
 

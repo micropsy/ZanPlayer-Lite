@@ -29,7 +29,20 @@ interface VideoFile {
 }
 
 export interface TranscriptionBatchDonePayload {
+  job_id?: number;
   tracks: BatchDoneTrack[];
+}
+
+/** Completion/failure event shapes emitted with a `job_id` so a stale run (a
+ *  previous video whose job outlived the switch) can be recognized and dropped. */
+export interface TranscriptionDonePayload {
+  job_id?: number;
+  total?: number;
+}
+
+export interface TranscriptionErrorPayload {
+  job_id?: number;
+  message?: string;
 }
 
 export interface InterfaceVideoFile {
@@ -98,6 +111,30 @@ export interface ProjectData {
 export const isTauri = (): boolean => {
   if (typeof window === "undefined") return false;
   return "__TAURI_INTERNALS__" in window;
+};
+
+/** True when running inside the native macOS app window. With
+ *  `titleBarStyle: "Overlay"` + `hiddenTitle` the macOS traffic lights
+ *  (close/minimize/zoom) float over the top-left of the custom DOM strip, so
+ *  chrome there must clear ~76px or the sidebar hamburger crowds the buttons. */
+export const isMacOs = (): boolean => {
+  if (typeof navigator === "undefined") return false;
+  return /Macintosh|Mac OS X/.test(navigator.userAgent);
+};
+
+/** True when running on a touch OS (Android / iOS) — the ONLY case the sidebar
+ *  may be a drawer that overlays the video below `md`. On any desktop platform
+ *  (macOS/Windows/Linux Tauri webview or a desktop browser, however narrow the
+ *  window) the sidebar is ALWAYS inline and pushes the video, so a small
+ *  desktop window can never turn it into a floating layer over the picture. */
+export const isMobileDevice = (): boolean => {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  if (/Android|iPhone|iPod/i.test(ua)) return true;
+  if (/iPad/i.test(ua)) return true;
+  // iPadOS 13+ sends a desktop Mac UA; distinguish a real iPad by its touch
+  // hardware (an iPad reports multiple touch points, a Mac laptop has none).
+  return /Macintosh|Mac OS X/i.test(ua) && navigator.maxTouchPoints > 1;
 };
 
 export class TauriService {
@@ -231,7 +268,8 @@ export class TauriService {
     modelName: string,
     language: string | undefined,
     subtitleMode: "original" | "english" | "both",
-    transcriptionMode: "stream" | "batch"
+    transcriptionMode: "stream" | "batch",
+    jobId: number
   ): Promise<void> {
     if (!isTauri()) {
       throw new Error("This feature requires the Tauri app");
@@ -242,6 +280,7 @@ export class TauriService {
       language,
       subtitleMode,
       transcriptionMode,
+      jobId,
     });
   }
 
@@ -259,11 +298,11 @@ export class TauriService {
     });
   }
 
-  static async pollTranscriptCues(): Promise<SubtitleCue[]> {
+  static async pollTranscriptCues(jobId: number): Promise<SubtitleCue[]> {
     if (!isTauri()) {
       return [];
     }
-    const cues = await invoke<BackendCue[]>("poll_transcript_cues");
+    const cues = await invoke<BackendCue[]>("poll_transcript_cues", { jobId });
     return cues.map((c) => ({
       id: c.id,
       startTime: c.start_time,
@@ -271,6 +310,17 @@ export class TauriService {
       text: c.text,
       kind: c.kind,
     }));
+  }
+
+  /** True while the backend job `jobId` is still decoding. The frontend uses
+   *  this as a safety net so a completion event that was missed (fast batch
+   *  run, stale listener) can still clear the `isTranscribing` flag instead of
+   *  permanently blocking the next auto-transcription. */
+  static async transcriptionActive(jobId: number): Promise<boolean> {
+    if (!isTauri()) {
+      return false;
+    }
+    return await invoke<boolean>("transcription_active", { jobId });
   }
 
   static async downloadWhisperModel(
@@ -425,5 +475,22 @@ export class TauriService {
       return;
     }
     await invoke<void>("mpv_stop");
+  }
+
+  /** Whether `ZANPLAYER_NATIVE_LAYOUT_DEBUG=1` was active at process start:
+   *  Rust sets a magenta border on the real native frame, and JS paints
+   *  complementary DOM outlines (red = `[data-player-viewport]`, blue =
+   *  `[data-sidebar]`, green = video layer, yellow = `[data-subtitle-layer]`)
+   *  so the two layers can be visually compared pixel-for-pixel without opening
+   *  a profiler. */
+  static async isNativeLayoutDebug(): Promise<boolean> {
+    if (!isTauri()) {
+      return false;
+    }
+    try {
+      return (await invoke<boolean>("native_layout_debug")) === true;
+    } catch {
+      return false;
+    }
   }
 }

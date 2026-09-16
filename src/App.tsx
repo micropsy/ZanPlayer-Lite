@@ -5,11 +5,11 @@ import { SubtitleEditor } from './components/SubtitleEditor';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Menu, FileVideo, Download } from 'lucide-react';
 import { listen, emit } from '@tauri-apps/api/event';
-import { TauriService, isTauri } from './services/tauri';
+import { TauriService, isTauri, isMacOs, isMobileDevice } from './services/tauri';
 import { useInstallPrompt } from './hooks/useInstallPrompt';
 import { checkForUpdates } from './services/updater';
 import { UpdateModal } from './components/UpdateModal';
-import { isVideoFile, isAudioFile, isSubtitleFile, isParsableSubtitleFile } from './common/mediaFormats';
+import { isMediaFile, isVideoFile, isAudioFile, isSubtitleFile, isParsableSubtitleFile } from './common/mediaFormats';
 
 function App() {
   const theme = useAppStore(state => state.theme);
@@ -24,6 +24,7 @@ function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
+  const [isFullscreenUi, setIsFullscreenUi] = useState(false);
   const { canInstall, promptInstall } = useInstallPrompt();
 
   // Helper to parse SRT
@@ -157,6 +158,7 @@ function App() {
   useEffect(() => {
     const handleFullscreenChange = () => {
       const isFullscreen = document.fullscreenElement !== null;
+      setIsFullscreenUi(isFullscreen);
       setSidebarVisible(!isFullscreen);
     };
     document.addEventListener('fullscreenchange', handleFullscreenChange);
@@ -227,7 +229,10 @@ function App() {
 
     if (!isTauri() && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const file = e.dataTransfer.files[0];
-      if (file.type.startsWith('video/') || file.type.startsWith('audio/')) {
+      // Classification is strictly extension-driven. Browser/OS MIME types are
+      // unreliable (an MKV drop can arrive labeled audio, or empty), so the
+      // supported-container catalog is the single source of truth.
+      if (isMediaFile(file.name)) {
         resetSubtitles(); // Wipe out subtitles from the previous video
         setCurrentVideo(file);
         const url = URL.createObjectURL(file);
@@ -263,13 +268,46 @@ function App() {
   return (
     <div 
       ref={containerRef}
-      className={`flex w-screen h-screen overflow-hidden ${
+      className={`flex flex-col w-screen h-screen overflow-hidden ${
         theme === 'dark' ? 'text-white' : 'text-gray-900'
       }`}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
+      {/* Solid top bar — replaces the native macOS title bar (window is
+          `titleBarStyle: Overlay` + `transparent`, so the traffic lights float
+          over this strip and its `data-tauri-drag-region` keeps the window
+          draggable). Chrome must paint its own opaque background here —
+          otherwise the transparent window leaks the desktop behind the
+          native title bar area. On macOS the strip clears the traffic-light
+          group (~76px) so the sidebar toggle icon never crowds the native
+          window controls. Hidden in web fullscreen. */}
+      {isTauri() && !isFullscreenUi && (
+        <div
+          data-tauri-drag-region
+          className={`flex h-10 w-full shrink-0 items-center border-b ${
+            isMacOs() ? "pl-[76px]" : "pl-2"
+          } pr-2 ${
+            theme === 'dark' ? 'bg-zan-black border-white/10' : 'bg-white border-gray-200'
+          }`}
+        >
+          {!sidebarVisible && (
+            <button
+              onClick={() => setSidebarVisible(true)}
+              aria-label="Open sidebar"
+              title="Open sidebar"
+              className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors ${
+                theme === 'dark' ? 'hover:bg-white/10 text-white' : 'hover:bg-gray-100 text-gray-900'
+              }`}
+            >
+              <Menu className="h-4 w-4" />
+            </button>
+          )}
+          <div className="flex-1" data-tauri-drag-region />
+        </div>
+      )}
+
       {/* Drag & Drop Overlay */}
       {isDragging && (
         <div className="absolute inset-0 z-50 bg-zan-cyan/10 border-4 border-dashed border-zan-cyan flex items-center justify-center">
@@ -280,45 +318,71 @@ function App() {
         </div>
       )}
 
-      {sidebarVisible && (
+      {/* Touch-device sidebar backdrop: dims the video behind the DRAWER only.
+          On desktop this never renders — the sidebar is always inline there,
+          so a narrow window must not blur/dim the stage behind it. `md:hidden`
+          drops it for a rotated phone/tablet that upgraded to inline. */}
+      {sidebarVisible && isMobileDevice() && (
         <div
           className="absolute inset-0 z-30 bg-black/45 backdrop-blur-[2px] md:hidden"
           onClick={() => setSidebarVisible(false)}
           aria-hidden="true"
         />
       )}
-      {sidebarVisible && <Sidebar />}
-      <div className="relative min-w-0 flex-1">
-        {!isTauri() && canInstall && (
-          <button
-            onClick={() => void promptInstall()}
-            aria-label="Install app"
-            title="Install ZanPlayer Lite on this device"
-            className={`absolute right-4 pwa-safe-top z-40 flex h-10 items-center gap-1.5 rounded-xl border px-3 text-sm font-medium transition-colors ${
-              theme === 'dark'
-                ? 'border-white/10 bg-zan-black/90 text-white shadow-xl shadow-black/20 hover:bg-zan-deep'
-                : 'border-gray-200 bg-white/95 text-gray-900 shadow-xl shadow-gray-300/30 hover:bg-gray-100'
-            }`}
-          >
-            <Download className="h-4 w-4" />
-            Install app
-          </button>
-        )}
-        {!sidebarVisible && (
-          <button
-            onClick={() => setSidebarVisible(true)}
-            aria-label="Open sidebar"
-            title="Open sidebar"
-            className={`absolute left-4 pwa-safe-top z-40 flex h-10 w-10 items-center justify-center rounded-xl border transition-colors ${
-              theme === 'dark'
-                ? 'border-white/10 bg-zan-black/90 text-white shadow-xl shadow-black/20 hover:bg-zan-deep'
-                : 'border-gray-200 bg-white/95 text-gray-900 shadow-xl shadow-gray-300/30 hover:bg-gray-100'
-            }`}
-          >
-            <Menu className="h-5 w-5" />
-          </button>
-        )}
-        <VideoPlayer onEditSubtitles={() => setEditorOpen(true)} />
+
+      {/* Content row — sidebar + main stage, below the top bar. The sidebar
+          paints its own opaque theme background; the main stage is transparent
+          so the native mpv surface (behind the webview) shows through.
+          `isolate` makes the row an airtight stacking context of its own: the
+          sidebar (z-40) and `data-player-viewport` (z-0) are then guaranteed
+          siblings whose internal paints can never bleed across each other. */}
+      <div data-content-row className="relative isolate flex min-h-0 flex-1 overflow-hidden">
+        {sidebarVisible && <Sidebar />}
+        {/* `data-player-viewport`: the canonical PlayerViewport region. App
+            shell layout owns it — the sidebar is a flex SIBLING (`z-40`), so
+            this column's box slides with the sidebar edge in the same commit:
+            open -> X/width shrink, closed -> the column fills the row. The
+            Player consumes this box VERBATIM for the native surface
+            (`mpv_set_layout`) and renders every overlay (subtitles, controls,
+            OSD) inside it; it never re-derives or clamps against sidebar
+            geometry. `overflow-clip` physically prevents the HTML5 fallback
+            box and the DOM overlays from painting outside the viewport.
+            `z-0` forces this column into its OWN stacking context: the player's
+            high-z DOM (controls bar z-40, quick settings z-50, subtitles z-30)
+            is then trapped BELOW the sidebar (z-40) instead of being promoted
+            into the row and painted over it. */}
+        <div data-player-viewport className="relative z-0 min-h-0 min-w-0 flex-1 overflow-clip">
+          {!isTauri() && canInstall && (
+            <button
+              onClick={() => void promptInstall()}
+              aria-label="Install app"
+              title="Install ZanPlayer Lite on this device"
+              className={`absolute right-4 pwa-safe-top z-40 flex h-10 items-center gap-1.5 rounded-xl border px-3 text-sm font-medium transition-colors ${
+                theme === 'dark'
+                  ? 'border-white/10 bg-zan-black/90 text-white shadow-xl shadow-black/20 hover:bg-zan-deep'
+                  : 'border-gray-200 bg-white/95 text-gray-900 shadow-xl shadow-gray-300/30 hover:bg-gray-100'
+              }`}
+            >
+              <Download className="h-4 w-4" />
+              Install app
+            </button>
+          )}
+          {!isTauri() && !sidebarVisible && (
+            <button
+              onClick={() => setSidebarVisible(true)}
+              aria-label="Open sidebar"
+              title="Open sidebar"
+              className={`absolute left-4 pwa-safe-top z-40 flex h-10 w-10 items-center justify-center rounded-xl border transition-colors ${
+                theme === 'dark'
+                  ? 'border-white/10 bg-zan-black/90 text-white shadow-xl shadow-black/20 hover:bg-zan-deep'
+                  : 'border-gray-200 bg-white/95 text-gray-900 shadow-xl shadow-gray-300/30 hover:bg-gray-100'
+              }`}
+            >
+              <Menu className="h-5 w-5" />
+            </button>
+          )}
+          <VideoPlayer onEditSubtitles={() => setEditorOpen(true)} />
+        </div>
       </div>
       {editorOpen && <SubtitleEditor onClose={() => setEditorOpen(false)} />}
       <UpdateModal />

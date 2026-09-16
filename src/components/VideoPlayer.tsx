@@ -13,6 +13,7 @@ import {
   FileVideo,
   CheckCircle2,
   Loader2,
+  RotateCcw,
   ChevronRight,
   ChevronLeft,
   Settings2,
@@ -20,11 +21,19 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "../utils/cn";
+import { html5UnsupportedHint } from "../common/mediaFormats";
+import {
+  enforceRightOfSidebar,
+  type SidebarBoundary,
+  type StageRect,
+} from "../services/videoLayout";
 import {
   TauriService,
   isTauri,
   type MpvTimeUpdatePayload,
   type TranscriptionBatchDonePayload,
+  type TranscriptionDonePayload,
+  type TranscriptionErrorPayload,
 } from "../services/tauri";
 import type { SubtitleCue } from "../types/subtitle";
 
@@ -69,6 +78,12 @@ const TRANSLATION_TRACK_NAME = "Auto-Generated (English)";
 // Standard media-player playback speeds, cycled/selected from the control bar.
 const SPEED_RATES = [0.5, 1, 1.25, 1.5, 2] as const;
 
+// Grace window for the native decode watchdog. A file mpv cannot demux/decode
+// still triggers `mpv-loaded` and returns OK from `loadfile`, but its 250 ms
+// ticker never reports a real duration or advancing playhead — after this long
+// the player cuts to the HTML5 fallback instead of stranding on a black frame.
+const NATIVE_DECODE_WATCHDOG_MS = 5000;
+
 export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const nativeStageRef = useRef<HTMLDivElement | null>(null);
@@ -87,12 +102,20 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const resumeAppliedRef = useRef(false);
   const engineRef = useRef<"html5" | "mpv" | null>(null);
   engineRef.current = engine;
+  // Set once mpv's clock reports a real duration or playhead for the current
+  // file — the signal that the file actually demuxed/decoded. The decode
+  // watchdog re-reads this instead of subscribing to a second ticker listener.
+  const nativeDecodeProvenRef = useRef(false);
   const recordPlaybackRef = useRef<() => void>(() => {});
   const [showCCMenu, setShowCCMenu] = useState(false);
   const [ccMenuView, setCcMenuView] = useState<"root" | "source" | "output" | "genmode">("root");
   const [showQuickSettings, setShowQuickSettings] = useState(false);
   const [showSpeedMenu, setShowSpeedMenu] = useState(false);
   const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
+  // HTML5 fallback failure of the loaded container (e.g. MKV on a build
+  // without the native engine). Rendered as a visible overlay so a container
+  // the fallback player can't demux never fails as a silent black frame.
+  const [videoLoadError, setVideoLoadError] = useState<string | null>(null);
   const {
     currentVideo,
     currentVideoUrl,
@@ -141,6 +164,15 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const controlsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingPlayRef = useRef(false);
   const transcriptionGenerationRef = useRef(0);
+  // Job identity for the current transcription run. Every `start_transcription`
+  // carries a fresh id; polls, seeks and event guards use it to talk only to
+  // that run (a previous file's still-decoding job keeps its own queue entries).
+  const transcriptionJobIdRef = useRef<number | null>(null);
+  // Spoken language the last decode was (re)generated with — the language-change
+  // effect regenerates once, and once only, per language value. Starts at the
+  // initial user language so a freshly-loaded project's existing generated
+  // tracks are never needlessly regenerated on mount.
+  const lastGenLanguageRef = useRef<string>(sourceLanguage);
   // Resume-at-load: the media element is still buffering when a recent-history
   // item is opened, so the target position is parked here and applied on the
   // next `loadedmetadata` (the store `resumeAt` request is consumed in the same
@@ -630,10 +662,16 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   // through the render queue and the `transcription-*` events.
   const transcribeVideo = async (videoPathOverride?: string) => {
     const s = useAppStore.getState();
-    if (s.isTranscribing) return;
     const videoPath = videoPathOverride || s.currentVideoPath;
     if (!videoPath) {
       console.error("Auto-transcribe requires a video path");
+      return;
+    }
+    // Same file still decoding → don't stack a second job. A stale `isTranscribing`
+    // flag from a *previous* file (its final event missed, engine switched away)
+    // must not block the current file, so a new path is always allowed to start
+    // its own job — the backend scopes queue/seek/status per job id.
+    if (s.isTranscribing && streamingPathRef.current === videoPath && videoPath === s.currentVideoPath) {
       return;
     }
     setTranscriptionError(null);
@@ -645,6 +683,9 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     translationStreamTrackIdRef.current = `${baseTrackId}-tr`;
     isBatchRef.current = s.transcriptionMode === "batch";
     realtimeStartedRef.current = false;
+    const jobId = Date.now();
+    transcriptionJobIdRef.current = jobId;
+    lastGenLanguageRef.current = s.sourceLanguage;
     setIsTranscribing(true);
     setTranscriptionProgress(0);
     // Pin whisper's recognition to the selected spoken language (auto-detection
@@ -656,7 +697,8 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
         s.whisperModel,
         lang,
         s.subtitleMode,
-        s.transcriptionMode
+        s.transcriptionMode,
+        jobId
       );
     } catch (err) {
       if (transcriptionGenerationRef.current === gen) {
@@ -673,9 +715,11 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const flushQueuedCues = useCallback(async (): Promise<void> => {
     if (pollInFlightRef.current) return;
     if (isBatchRef.current) return; // batch surfaces cues via the done event
+    const jobId = transcriptionJobIdRef.current;
+    if (jobId == null) return;
     pollInFlightRef.current = true;
     try {
-      const cues = await TauriService.pollTranscriptCues();
+      const cues = await TauriService.pollTranscriptCues(jobId);
       const s = useAppStore.getState();
       if (cues.length === 0) return;
       if (s.currentVideoPath !== streamingPathRef.current) return;
@@ -720,13 +764,31 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   // Poll the Rust render queue while a realtime transcription job is active. Cues
 // are appended to the live tracks the moment they land (realtime-first). In
 // batch mode cues are delivered whole by `transcription-batch-done` instead.
-  useEffect(() => {
+useEffect(() => {
     if (!isTranscribing) return;
     if (isBatchRef.current) return;
     let disposed = false;
     const flush = async () => {
       if (disposed) return;
       await flushQueuedCues();
+      // Safety net: if the backend job already finished but its final event was
+      // missed (fast batch run, listener torn down mid-job), clear the flag so
+      // the next video can still auto-transcribe instead of staying blocked.
+      // The backend reports `false` only once the run is over or a newer job
+      // took over, so this never nukes an actually-decoding job.
+      const s = useAppStore.getState();
+      if (!s.isTranscribing) return;
+      const jobId = transcriptionJobIdRef.current;
+      if (jobId == null) return;
+      try {
+        const stillActive = await TauriService.transcriptionActive(jobId);
+        if (!stillActive) {
+          setTranscriptionProgress(100);
+          setIsTranscribing(false);
+        }
+      } catch {
+        // Status probe is best-effort; the cue events remain authoritative.
+      }
     };
     void flush();
     const timer = window.setInterval(() => void flush(), 150);
@@ -734,7 +796,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [isTranscribing, flushQueuedCues]);
+  }, [isTranscribing, flushQueuedCues, setTranscriptionProgress, setIsTranscribing]);
 
   // Backend event wiring: progress, done, error + dropped-video autoplay.
   // Mounted once; generation refs keep stale jobs from touching the UI.
@@ -745,16 +807,35 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
 
     const setup = async () => {
       unlisteners.push(
-        await listen<{ percentage: number }>("transcription-progress", (event) => {
-          if (disposed) return;
-          const pct = Math.min(100, Math.max(0, event.payload?.percentage ?? 0));
-          setTranscriptionProgress(pct);
-        })
+        await listen<{ percentage: number; job_id?: number }>(
+          "transcription-progress",
+          (event) => {
+            if (disposed) return;
+            // Only this run's progress drives the indicator; a stale job from a
+            // previous video must not overwrite the current percentage.
+            if (
+              typeof event.payload?.job_id === "number" &&
+              event.payload.job_id !== transcriptionJobIdRef.current
+            ) {
+              return;
+            }
+            const pct = Math.min(100, Math.max(0, event.payload?.percentage ?? 0));
+            setTranscriptionProgress(pct);
+          }
+        )
       );
 
       unlisteners.push(
-        await listen<{ total: number }>("transcription-done", async () => {
+        await listen<TranscriptionDonePayload>("transcription-done", async (event) => {
           if (disposed) return;
+          // A completion from a run that is no longer ours (the user switched
+          // videos and started a new job) must not finalize the new job's state.
+          if (
+            typeof event.payload?.job_id === "number" &&
+            event.payload.job_id !== transcriptionJobIdRef.current
+          ) {
+            return;
+          }
           // Final drain so no cue is lost between the last poll and completion.
           const gen = transcriptionGenerationRef.current;
           await flushQueuedCues();
@@ -769,6 +850,14 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
           "transcription-batch-done",
           (event) => {
             if (disposed) return;
+            // A stale batch completion (previous video's job) must not replace
+            // the tracks of the run the user is actually waiting on.
+            if (
+              typeof event.payload?.job_id === "number" &&
+              event.payload.job_id !== transcriptionJobIdRef.current
+            ) {
+              return;
+            }
             const s = useAppStore.getState();
             if (s.currentVideoPath !== streamingPathRef.current) return;
             const tracks = (event.payload?.tracks ?? []).map((batch) => {
@@ -817,9 +906,18 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
       );
 
       unlisteners.push(
-        await listen<string>("transcription-error", (event) => {
+        await listen<TranscriptionErrorPayload>("transcription-error", (event) => {
           if (disposed) return;
-          const message = typeof event.payload === "string" ? event.payload : "Transcription failed";
+          // A failed run from a *previous* video must not pop an error on the
+          // current one — only this run's failure is surfaced.
+          if (
+            typeof event.payload?.job_id === "number" &&
+            event.payload.job_id !== transcriptionJobIdRef.current
+          ) {
+            return;
+          }
+          const message =
+            event.payload?.message ?? "Transcription failed";
           console.error("Transcription error:", message);
           setTranscriptionError(message);
           setIsTranscribing(false);
@@ -872,6 +970,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
         const clamped = Math.max(0, position);
         setMpvClock({ position: clamped, duration: Math.max(0, duration) });
         setCurrentTime(clamped);
+        if (duration > 0 || clamped > 0) nativeDecodeProvenRef.current = true;
         if (ended) {
           setIsPlaying(false);
         } else {
@@ -896,41 +995,152 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     // Registers/unregisters only when the engine actually switches to mpv.
   }, [engine]);
 
-  // Keep the embedded mpv surface glued to the DOM video stage: any layout
-  // change (window resize, sidebar/toolbar reflow, fullscreen toggle) is
-  // re-anchored through `mpv_set_layout`. A rAF chip beats ResizeObserver here
-  // because it also catches *moves* (rect shifts without a size change), and
-  // IPC is coalesced to whole CSS pixels so it never spams the backend.
+  // Keep the embedded mpv surface glued to the PlayerViewport. App shell layout
+  // owns the viewport (`[data-player-viewport]` — the content column right of
+  // the sidebar on desktop, the full-window column under a mobile drawer); the
+  // Player consumes its rect VERBATIM for `mpv_set_layout`. The Player never
+  // measures the sidebar, never subtracts it, never clamps — App shell flex
+  // already placed this column, so the measured rect below IS the region. Any
+  // layout change (window drag/resize, sidebar reflow, fullscreen toggle,
+  // manual container resizing) re-anchors through the viewport's
+  // ResizeObserver plus explicit `resize` / `fullscreenchange` listeners, all
+  // coalesced into at most one rAF per frame; `mpv-loaded` re-asserts right
+  // after a fresh host is created. IPC is coalesced to whole CSS pixels so it
+  // never spams the backend.
+  //
+  // If `[data-player-viewport]` is ever absent from the DOM, the reporter sends
+  // NO native layout (graceful missing-element handling) and retries once per
+  // frame until the viewport mounts.
   useEffect(() => {
     if (!isTauri() || engine !== "mpv") return;
-    const stage = nativeStageRef.current;
-    if (!stage) return;
+    // Layout debug outlines: one-shot paint when ZANPLAYER_NATIVE_LAYOUT_DEBUG=1
+    // is active. DOM colors — red = PlayerViewport, blue = sidebar, green =
+    // video layer (native stage / HTML5 <video>), yellow = subtitles — are
+    // compared against the magenta native-layer border in Rust.
+    if (typeof window !== "undefined" && !(window as any).__zanLayoutDebugDone) {
+      (window as any).__zanLayoutDebugDone = true;
+      TauriService.isNativeLayoutDebug()
+        .then((on) => {
+          if (!on) return;
+          const apply = (sel: string, color: string) => {
+            const el = document.querySelector<HTMLElement>(sel);
+            if (el) el.style.outline = `2px solid ${color}`;
+          };
+          apply("[data-player-viewport]", "red");
+          apply("[data-sidebar]", "blue");
+          apply("[data-subtitle-layer]", "yellow");
+          apply("video", "green");
+          apply("[data-native-stage]", "green");
+        })
+        .catch(() => {});
+    }
     let disposed = false;
+    let raf = 0;
+    let pending = false;
     let lastKey = "";
+    let viewportObserver: ResizeObserver | null = null;
+    let unlistenLoaded: (() => void) | null = null;
+    // EVENT-DRIVEN: every trigger funnels into `scheduleLayout`, coalescing
+    // into at most one animation frame. `report()` re-measures the viewport and
+    // dispatches a rect only when the geometry actually changes
+    // (`key === lastKey` short-circuits), so once anchored the page jumps to
+    // idle instead of burning 60fps forever. Triggers: the viewport resizing
+    // (ResizeObserver), window resize, fullscreen toggle, and a freshly mounted
+    // host after a file load (`mpv-loaded`). Sidebar toggles are covered by the
+    // viewport ResizeObserver — App shell reflows the column, the box slides,
+    // RO reports it. The Player never subscribes to sidebar state.
+    const scheduleLayout = () => {
+      if (disposed || pending) return;
+      pending = true;
+      raf = requestAnimationFrame(() => {
+        pending = false;
+        report();
+      });
+    };
     const report = () => {
       if (disposed) return;
-      const r = stage.getBoundingClientRect();
-      const key = `${Math.round(r.x)}:${Math.round(r.y)}:${Math.round(r.width)}:${Math.round(
-        r.height
-      )}`;
+      const viewport = document.querySelector<HTMLElement>("[data-player-viewport]");
+      if (!viewport) {
+        // No PlayerViewport in the DOM — send NO native layout (graceful
+        // absence) and retry once per frame until it mounts. Coalesced: never
+        // more than one queued retry.
+        scheduleLayout();
+        return;
+      }
+      const r = viewport.getBoundingClientRect();
+      // A not-yet-laid-out viewport reads as a zero-size rect. Never forward a
+      // degenerate anchor — the native surface keeps its last good frame rather
+      // than collapsing to a 0×0 top-left patch while the layout settles.
+      if (r.width < 1 || r.height < 1) {
+        scheduleLayout();
+        return;
+      }
+      let rect: StageRect = {
+        x: Math.round(r.x),
+        y: Math.round(r.y),
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+      };
+      // RIGHT-OF-SIDEBAR INVARIANT (desktop inline): the native surface must
+      // never start to the left of an inline sidebar's right edge — otherwise
+      // the picture paints under/over the sidebar instead of beside it. App
+      // shell flex already places the column exactly at that edge, so this is
+      // an identity in every correct state (the verbatim contract holds). It
+      // only re-anchors a stale or mid-toggle column rect that would otherwise
+      // let the video bleed under the sidebar. Drawer mode (mobile) is untouched.
+      let boundary: SidebarBoundary | null = null;
+      const sidebar = document.querySelector<HTMLElement>("[data-sidebar]");
+      if (sidebar) {
+        const s = sidebar.getBoundingClientRect();
+        if (s.width >= 1 && s.right > 0) {
+          boundary = {
+            right: s.right,
+            inline: getComputedStyle(sidebar).position !== "absolute",
+          };
+        }
+      }
+      rect = enforceRightOfSidebar(rect, boundary);
+      if (rect.width < 1 || rect.height < 1) {
+        scheduleLayout();
+        return;
+      }
+      const key = `${rect.x}:${rect.y}:${rect.width}:${rect.height}`;
       if (key === lastKey) return;
       lastKey = key;
-      void TauriService.mpvSetLayout({ x: r.x, y: r.y, width: r.width, height: r.height }).catch(
-        () => {}
-      );
+      if (sessionStorage.getItem("zanplayerTrace") === "1") {
+        console.debug(
+          "[mpv-layout-js]",
+          `viewport=(${rect.x},${rect.y}) ${rect.width}x${rect.height}`
+        );
+      }
+      void TauriService.mpvSetLayout(rect).catch(() => {});
     };
+    // Initial anchor — synchronous so the very first established frame keeps the
+    // host exactly on the viewport, independent of any pending animation frame.
     report();
     if (typeof requestAnimationFrame !== "function") return;
-    let raf = 0;
-    const loop = () => {
-      if (disposed) return;
-      report();
-      raf = requestAnimationFrame(loop);
-    };
-    raf = requestAnimationFrame(loop);
+    window.addEventListener("resize", scheduleLayout);
+    document.addEventListener("fullscreenchange", scheduleLayout);
+    if (typeof ResizeObserver !== "undefined") {
+      viewportObserver = new ResizeObserver(scheduleLayout);
+      const vp = document.querySelector<HTMLElement>("[data-player-viewport]");
+      if (vp) viewportObserver.observe(vp);
+    }
+    // A freshly loaded file creates a new native host — re-assert the anchor
+    // right after so the newly created surface lands on the measured rect
+    // rather than wherever the previous host was left.
+    void listen("mpv-loaded", () => {
+      if (!disposed) scheduleLayout();
+    }).then((fn) => {
+      unlistenLoaded = fn;
+    });
     return () => {
       disposed = true;
       cancelAnimationFrame(raf);
+      window.removeEventListener("resize", scheduleLayout);
+      document.removeEventListener("fullscreenchange", scheduleLayout);
+      viewportObserver?.disconnect();
+      unlistenLoaded?.();
     };
   }, [engine]);
 
@@ -968,12 +1178,60 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     };
   }, [engine, currentVideoPath]);
 
+  // Native decode watchdog: `loadfile` returns OK for a file mpv ultimately
+  // cannot demux/decode (renamed path, corrupt container, headless codec), so
+  // no `mpv-load` error ever surfaces — the player would strand on a silent
+  // black frame. mpv's 250 ms ticker only emits one (0, 0) snapshot for such a
+  // file, so if its clock never proves itself (any real duration or playhead
+  // — tracked in `nativeDecodeProvenRef` by the clock-mirror listener) within
+  // the grace window, cut back to the HTML5 blob engine the same way an embed
+  // loss would. Its own failure surfaces then (codec hint / onError).
+  useEffect(() => {
+    if (!isTauri() || engine !== "mpv" || !currentVideoPath) return;
+    nativeDecodeProvenRef.current = false;
+    let disposed = false;
+    const timer = window.setTimeout(() => {
+      if (disposed) return;
+      if (nativeDecodeProvenRef.current) return;
+      nativeLoadedRef.current = false;
+      resumeAppliedRef.current = false;
+      console.error(
+        "Native mpv clock never decoded the file — falling back to HTML5"
+      );
+      setEngine("html5");
+      TauriService.getVideoBlobUrl(currentVideoPath)
+        .then((blobUrl) => {
+          if (!disposed) setVideoSource(blobUrl);
+        })
+        .catch((err) => {
+          if (!disposed) setVideoSource(null);
+          console.error("HTML5 fallback blob load failed:", err);
+        });
+    }, NATIVE_DECODE_WATCHDOG_MS);
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+    };
+  }, [engine, currentVideoPath]);
+
   const handleToggleSubtitles = () => {
     const turningOn = !showSubtitles;
     setShowSubtitles(turningOn);
     if (turningOn && subtitleTracks.length === 0 && !isTranscribing) {
       transcribeVideoRef.current();
     }
+  };
+
+  // Retry a failed transcription in place, without reloading the video. Any
+  // partial generated tracks from the failed attempt are dropped and a fresh
+  // job (new job_id) is started for the same file — the old worker can never
+  // resurface cues or finalize the new run.
+  const retryTranscription = () => {
+    const s = useAppStore.getState();
+    if (s.isTranscribing) return;
+    setTranscriptionError(null);
+    s.removeGeneratedTracks();
+    transcribeVideoRef.current(s.currentVideoPath ?? undefined);
   };
 
   // Handle video source management & engine selection. A browser-supplied
@@ -1060,6 +1318,32 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     void transcribeVideoRef.current(s.currentVideoPath);
   }, []);
 
+  // Changing the spoken language must regenerate the subtitles of the loaded
+  // video in the newly selected language. Generated tracks are dropped and a
+  // fresh job is pinned to the new ISO code. The `lastGenLanguageRef` guard
+  // makes the regeneration fire once per language value (re-running when the
+  // job finishes would otherwise loop: complete → effect → regen → repeat).
+  useEffect(() => {
+    if (!currentVideoPath || !showSubtitles) return;
+    if (isTranscribing) return;
+    if (!subtitleTracks.some((t) => t.isGenerated)) return;
+    if (lastGenLanguageRef.current === sourceLanguage) return;
+    regenerateForVideo();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sourceLanguage, isTranscribing, currentVideoPath, showSubtitles, regenerateForVideo]);
+
+  // When the fallback <video> engine is active, a container it can't demux
+  // (MKV/AVI/FLV/WMV on WebKit/Safari, narrow codec sets in Chromium) would
+  // otherwise fail as a silent black frame. Show an actionable message instead.
+  // The native engine is never blocked by this — it only applies to `html5`.
+  useEffect(() => {
+    setVideoLoadError(null);
+    if (engine !== "html5") return;
+    const name = currentVideo?.name ?? currentVideoPath?.split(/[\\/]/).pop() ?? "";
+    const hint = html5UnsupportedHint(name);
+    if (hint) setVideoLoadError(hint);
+  }, [engine, currentVideoPath, currentVideo]);
+
   const applyOutputMode = (mode: "original" | "english" | "both") => {
     setSubtitleMode(mode);
     setCcMenuView("root");
@@ -1130,7 +1414,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   return (
     <div
       className={cn(
-        "relative w-full h-full group",
+        "relative w-full h-full group overflow-clip",
         // Native mpv draws behind the transparent webview stage, so the player
         // root must stay transparent; HTML5 keeps an opaque letterbox.
         isNative ? "" : "bg-black"
@@ -1147,7 +1431,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
           {isNative ? (
             <div
               ref={nativeStageRef}
-              className="relative z-0 w-full h-full"
+              className="relative z-0 w-full h-full overflow-clip"
               role="group"
               aria-label="Native video surface"
               data-native-stage
@@ -1162,6 +1446,14 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
             ref={videoRef}
             src={videoSource ?? undefined}
             className="relative z-0 w-full h-full object-contain"
+            onError={() => {
+              const s = useAppStore.getState();
+              const name =
+                s.currentVideo?.name ?? s.currentVideoPath?.split(/[\\/]/).pop() ?? "";
+              setVideoLoadError(
+                html5UnsupportedHint(name) ?? "This file failed to play in the fallback player."
+              );
+            }}
             onTimeUpdate={handleTimeUpdate}
             onSeeked={handleSeeked}
             onPlay={() => setIsPlaying(true)}
@@ -1226,6 +1518,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
               play/pause overlay, below the controls bar. */}
           {showSubtitles && (currentCue || originalCue || translationCue) && (
             <div
+              data-subtitle-layer
               className={cn(
                 "absolute left-0 right-0 flex flex-col items-center px-4 pointer-events-none z-30",
                 subtitleStyle.alignment === "bottom" ? "bottom-24" : "top-24"
@@ -1299,6 +1592,16 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
               </div>
             )}
           </div>
+
+          {/* Fallback-load error overlay — a container the HTML5 engine can't
+              demux fails loudly instead of as a silent black frame. */}
+          {videoLoadError && (
+            <div className="absolute inset-0 z-[25] flex items-center justify-center px-8 pointer-events-none">
+              <div className="max-w-xl text-center bg-black/70 backdrop-blur rounded-xl border border-red-900/60 px-6 py-5">
+                <p className="text-red-400 text-sm leading-relaxed break-words">{videoLoadError}</p>
+              </div>
+            </div>
+          )}
 
           {/* Transcribing Indicator */}
           {/* Top-right corner so it never overlaps the bottom-center subtitle overlay. */}
@@ -1618,7 +1921,19 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
                               <ChevronRight className="w-4 h-4 text-gray-500" />
                             </button>
                             {transcriptionError && (
-                              <p className="px-3 py-2 text-xs text-red-400 break-all">{transcriptionError}</p>
+                              <div className="px-3 py-2 text-xs">
+                                <p className="text-red-400 break-all">{transcriptionError}</p>
+                                <button
+                                  onClick={() => {
+                                    setShowCCMenu(false);
+                                    retryTranscription();
+                                  }}
+                                  className="mt-1 inline-flex items-center gap-1 text-zan-cyan hover:text-white"
+                                >
+                                  <RotateCcw className="w-3 h-3" />
+                                  Retry
+                                </button>
+                              </div>
                             )}
                           </div>
                         </>
@@ -1758,15 +2073,13 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
         )}>
           <FileVideo className="w-16 h-16 mb-4 opacity-50" />
           <p className="text-lg">Select a video or audio file to start</p>
-          <div className="mt-6 text-sm text-gray-600 max-w-md text-center">
-            <p className="mb-2">Keyboard shortcuts:</p>
-            <div className="grid grid-cols-2 gap-2">
-              <span><kbd className="bg-zan-black px-2 py-1 rounded">Space</kbd> Play/Pause</span>
-              <span><kbd className="bg-zan-black px-2 py-1 rounded">←/→</kbd> Seek</span>
-              <span><kbd className="bg-zan-black px-2 py-1 rounded">↑/↓</kbd> Volume</span>
-              <span><kbd className="bg-zan-black px-2 py-1 rounded">M</kbd> Mute</span>
-              <span><kbd className="bg-zan-black px-2 py-1 rounded">F</kbd> Fullscreen</span>
-            </div>
+          <div className="mt-6 flex max-w-md flex-wrap items-center justify-center gap-x-4 gap-y-2 text-sm text-gray-600 text-center">
+            <p className="w-full mb-1">Keyboard shortcuts:</p>
+            <span className="whitespace-nowrap"><kbd className="bg-zan-black px-2 py-1 rounded">Space</kbd> Play/Pause</span>
+            <span className="whitespace-nowrap"><kbd className="bg-zan-black px-2 py-1 rounded">←/→</kbd> Seek</span>
+            <span className="whitespace-nowrap"><kbd className="bg-zan-black px-2 py-1 rounded">↑/↓</kbd> Volume</span>
+            <span className="whitespace-nowrap"><kbd className="bg-zan-black px-2 py-1 rounded">M</kbd> Mute</span>
+            <span className="whitespace-nowrap"><kbd className="bg-zan-black px-2 py-1 rounded">F</kbd> Fullscreen</span>
           </div>
 
           {/* Recent History */}

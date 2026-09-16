@@ -8,6 +8,8 @@ import {
   mimeForFile,
   mediaAcceptString,
   subtitleAcceptString,
+  isHtml5Playable,
+  html5UnsupportedHint,
   VIDEO_EXTENSIONS,
   AUDIO_EXTENSIONS,
   PARSABLE_SUBTITLE_EXTENSIONS,
@@ -73,5 +75,30 @@ describe("media formats catalog", () => {
     expect(subtitleAcceptString()).toContain(".vtt");
     expect(subtitleAcceptString()).not.toContain(".ass");
     expect(subtitleAcceptString()).not.toContain(".ssa");
+  });
+
+  it("html5 playability: MP4/WebM/MOV and common audio yes, MKV/AVI/FLV/WMV no", () => {
+    expect(isHtml5Playable("clip.mp4")).toBe(true);
+    expect(isHtml5Playable("clip.mov")).toBe(true);
+    expect(isHtml5Playable("clip.webm")).toBe(true);
+    expect(isHtml5Playable("song.mp3")).toBe(true);
+    expect(isHtml5Playable("song.flac")).toBe(true);
+    // containers the fallback player can't demux
+    expect(isHtml5Playable("movie.mkv")).toBe(false);
+    expect(isHtml5Playable("movie.avi")).toBe(false);
+    expect(isHtml5Playable("movie.flv")).toBe(false);
+    expect(isHtml5Playable("movie.wmv")).toBe(false);
+    // non-media is irrelevant, never "unplayable"
+    expect(isHtml5Playable("notes.txt")).toBe(false);
+  });
+
+  it("renders a hint only for media whose container the fallback can't decode", () => {
+    expect(html5UnsupportedHint("movie.mkv")).toContain("MKV");
+    expect(html5UnsupportedHint("movie.wmv")).toContain("WMV");
+    expect(html5UnsupportedHint("movie.mkv")).toContain("fallback player");
+    // playable media and non-media get no hint
+    expect(html5UnsupportedHint("clip.mp4")).toBeNull();
+    expect(html5UnsupportedHint("song.mp3")).toBeNull();
+    expect(html5UnsupportedHint("notes.txt")).toBeNull();
   });
 });

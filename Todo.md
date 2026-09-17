@@ -33,7 +33,7 @@ player window.
 
 ### 2. Verify Desktop Native Playback
 
-- [x] **Native backend migration (this session): libmpv → LibVLC.** The entire native engine is now `libvlc` (the C library VLCKit wraps), linked from the system VLC.app dylibs behind a single `vlc-native` cargo feature (default off — shipped builds stay HTML5 `<video>`). The old libmpv2 `wid` embed, the macOS Render-API/CAMetalLayer backend (`render/`), and the `native-player`/`macos-render` feature gates were deleted. New architecture: `libvlc.rs` (hand-rolled FFI, no crate) → `VlcSession` (session.rs) embedding VLC's video output into a dedicated host NSView (macOS `set_nsobject`; Windows HWND; X11 xwindow) below the transparent webview, a 250 ms coalesced `vlc-timeupdate` ticker, `vlc_set_layout` stage anchoring, `VLC_PLUGIN_PATH` set from the VLC.app bundle, and a slim `ZANPLAYER_NATIVE_SMOKE` build-time harness (playback + diagnostics checks). Frontend fully renamed: `vlc_*` commands/events, engine id `"VLC"`, `VlcClock`, `VlcTimeUpdatePayload`. The broken self-referential FFmpeg sidecar symlinks in `src-tauri/binaries/` (which silently broke every build) were repointed to the real Homebrew ffmpeg for aarch64. **Verified: `cargo build` (default, 0 warnings), `cargo build --features vlc-native` (0 warnings, links/runs against real VLC.app dylibs), `cargo test` 34/34, `cargo test --features vlc-native` 42/42 (incl. a live libvlc init/drop test), `npm run test` 106/106, `tsc` + `vite build` clean, `cargo clippy` clean on native_player.** The old 13-check macOS smoke battery is mpv-era history; a slim replacement smoke is implemented but not yet run on a real file.
+- [x] **Native backend migration (this session): libmpv → LibVLC.** The entire native engine is now `libvlc` (the C library VLCKit wraps), linked from the system VLC.app dylibs behind a single `vlc-native` cargo feature (default off — shipped builds stay HTML5 `<video>`). The old libmpv2 `wid` embed, the macOS Render-API/CAMetalLayer backend (`render/`), and the `native-player`/`macos-render` feature gates were deleted. New architecture: `libvlc.rs` (hand-rolled FFI, no crate) → `VlcSession` (session.rs) embedding VLC's video output into a dedicated host NSView (macOS `set_nsobject`; Windows HWND; X11 xwindow) below the transparent webview, a 250 ms coalesced `vlc-timeupdate` ticker, `vlc_set_layout` stage anchoring, `VLC_PLUGIN_PATH` set from the VLC.app bundle, and a slim `ZANPLAYER_NATIVE_SMOKE` build-time harness (playback + diagnostics checks). Frontend fully renamed: `vlc_*` commands/events, engine id `"VLC"`, `VlcClock`, `VlcTimeUpdatePayload`. The broken self-referential FFmpeg sidecar symlinks in `src-tauri/binaries/` (which silently broke every build) were repointed to the real Homebrew ffmpeg for aarch64. **Verified: `cargo build` (default, 0 warnings), `cargo build --features vlc-native` (0 warnings, links/runs against real VLC.app dylibs), `cargo test` 34/34, `cargo test --features vlc-native` 42/42 (incl. a live libvlc init/drop test), `npm run test` 106/106, `tsc` + `vite build` clean, `cargo clippy` clean on native_player.** The old 13-check macOS smoke battery is mpv-era history; a slim 10-check replacement smoke is implemented and **has passed live against a real MP4/H.264 file (2026-09-17, `RESULT: 10/10`, see the smoke item below) after the `f9b1f42` crash fixes (null media player / missing `play()` / off-main AppKit view work).**
 - [x] Run the full macOS interactive smoke battery with a real video file (MP4 and MKV, both 11/11 checks incl. sidebar reflow, multi-step manual resize, native + web fullscreen, and the sub-`md` narrow-window inline guard).
 - [x] Unify app-window frame: `titleBarStyle: Overlay` + `hiddenTitle`, solid `h-10` DOM top bar (drag region + sidebar hamburger), content row stacking sidebar + stage; smoke `findArea()` walks descendants (smallest bottom-right-reaching rect) so the 10-check battery stays 10/10 (MP4 + MKV) with the top bar accounted for at `y≈40`.
 - [x] Fix intermittent coordinate drift: `macos_surface::apply_layout` now computes the host frame DIRECTLY in content coords (no `convertRect:fromView:`, whose result depended on the host's *current* frame and accumulated error). The CAMetalLayer is re-anchored to the host bounds on every `mpv_set_layout` (`masksToBounds=YES`, CATransaction flush), and degenerate (0×0) rects are skipped on both Rust and JS sides. The smoke now reads back `applied_js_rect` (the ACTUAL host frame in JS coords) as the "applied" rect, so a misconverted `setFrame:` fails checks instead of hiding behind the request. Verified: MP4 10/10, MKV 10/10.
@@ -225,9 +225,22 @@ unsupported functionality.
   already holds the `vlc-embed-lost` listener, so a backend-side addition is drop-in.
 - [ ] **Re-run the codec decode matrix against libvlc (VLC.app 12.x)** — README table
   is still labeled "libmpv-era result — re-verify with libvlc".
-- [ ] **Run the slim smoke battery on a real file** (`.app` bundle with
-  `--features vlc-native`; `RESULT: N/10 passed` on macOS) — still PENDING (see
-  `docs/PLAYER_COMPOSITING_VERIFICATION.md` §6).
+- [x] **Run the slim smoke battery on a real file** — DONE 2026-09-17 against a real
+  MP4/H.264 (20 s, decoder = VideoToolbox): **`[native-smoke] RESULT: 10/10 passed` /
+  `PASS — VLC native verified`** (checks 1–10: session init, load/`vlc-loaded`, host NSView
+  attached + embed intact, demux out of Opening/NothingSpecial, clock advance, playing
+  state, host anchored to the measured DOM area `(352,40) 848×760`, non-degenerate applied
+  rect, DOM-alpha 0 over the stage centre). Run as `ZANPLAYER_NATIVE_SMOKE=1
+  ZANPLAYER_NATIVE_SMOKE_VIDEO=<path> src-tauri/target/debug/zanplayer-lite` (vite on
+  :5173); the app does not self-exit after `RESULT:` — kill it once the verdict prints.
+  The run surfaced three crashes now fixed in `f9b1f42`: (a) `VlcPlayer::new` never
+  created a media player (null `player` → `set_nsobject` SIGSEGV) — now one persistent
+  player with `set_media` track swaps; (b) `load` never issued `play` (pipeline stuck in
+  NothingSpecial) — now starts playback; (c) `macos_surface` view work ran off the AppKit
+  main thread (SIGSEGV) — now marshaled via `on_main`/`run_on_main_thread`.
+  `docs/PLAYER_COMPOSITING_VERIFICATION.md` §6 criteria 5/7/9 (runtime smoke) are now
+  covered; still pending there: `cargo check` of the Windows/X11 FFI arms on the macOS host
+  (scratch-crate-only) and a full `.app` bundle + MKV corpus re-run.
 - [ ] **Commit the entire migration + docs + CI worktree** — `HEAD` is still the
   mpv-era `9e9eb23`; the CI fix must land in the same commit as the migration or
   `main` stays red.

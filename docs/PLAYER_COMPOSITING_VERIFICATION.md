@@ -97,17 +97,51 @@ K controls bar `isolate` self-containment · L sidebar provably opaque (z-40,
 | `npm run build` (`tsc && vite build`) | clean |
 | `cargo test` (feature-off) | **34/34 passed** |
 | `cargo test --features vlc-native` | **42/42 passed** (incl. live `libvlc_new` init/drop against the real VLC.app dylibs) |
-| `cargo clippy --features vlc-native` | exit 0 on `native_player` (7 pre-existing style warnings elsewhere: `main.rs:584/778/819/950`, `pipeline.rs:297/380/396`) |
+| `cargo clippy --features vlc-native` | exit 0 on `native_player` (8 pre-existing diagnostic warnings in `main.rs:584/778/819/950` and `pipeline.rs:297/380/396`) |
 | `cargo build` / `--features vlc-native` | 0 warnings, links/runs against real VLC.app dylibs |
 
-## 6. Real macOS runtime verification — PENDING
+## 6. Real macOS runtime verification — PASSED (2026-09-17)
 
-The slim `ZANPLAYER_NATIVE_SMOKE` harness is implemented and compiles, but has
-**not yet been run on a real file** (requires building a `.app` bundle and
-driving it with a real video). Planned run:
+The slim `ZANPLAYER_NATIVE_SMOKE` harness ran live against a real MP4/H.264
+(20 s, 848×760 DOM stage, decoder = VideoToolbox) and printed
+**`[native-smoke] RESULT: 10/10 passed` / `PASS — VLC native verified`**.
 
-Env: `ZANPLAYER_NATIVE_SMOKE=1 ZANPLAYER_NATIVE_SMOKE_VIDEO=<path>
-ZANPLAYER_NATIVE_SMOKE_PAUSE=1 ZANPLAYER_TRACE=1` → log to `/tmp/zanplayer-smoke-vlc.log`
+Run shape that produced it (the binary does NOT self-exit after the verdict —
+kill it once `RESULT:` prints):
+
+```
+ZANPLAYER_NATIVE_SMOKE=1 ZANPLAYER_NATIVE_SMOKE_VIDEO=<path> \
+  src-tauri/target/debug/zanplayer-lite   # vite dev server must be on :5173
+```
+
+The first attempt **crashed twice**, and the fixes in `f9b1f42` made the
+battery go green — treat those failures as the tool at work, not the run:
+
+1. `VlcPlayer::new` left `player = null_mut()` (never created the media player)
+   → first `set_drawable` → `libvlc_media_player_set_nsobject(NULL)` SIGSEGV in
+   `var_SetChecked`. Fixed by creating one player per session and swapping media
+   with `libvlc_media_player_set_media` instead of replacing the player (the
+   drawable/input attrs now survive track changes).
+2. `VlcSession::load` affixed the drawable and set the media but never issued
+   `play` → pipeline stayed `NothingSpecial`, clock never advanced (checks 5–7
+   failed). `load` now starts playback.
+3. `macos_surface` view work (host creation, `addSubview:`, `setFrame:`, frame
+   reads) ran on the smoke/ticker/async-command threads — off the AppKit main
+   thread → `EXC_BAD_ACCESS`. A new `on_main` helper marshals the four
+   AppKit-touching functions onto the main loop (`run_on_main_thread`, bounded
+   `recv_timeout`; ObjC pointers cross as opaque i64 handles).
+
+Key log lines from the passing run:
+
+```
+[native-smoke] load OK — ticker running, vlc-loaded emitted
+videotoolbox decoder: Using Video Toolbox to decode 'h264'
+[native-smoke] diagnostics: ... state=playing time=0.15s length=20.03s playing=true vout=true ...
+[native-smoke] webview player area = 848x760 at (352,40) (actual host 848x760 at (352,40))
+[native-smoke] webview DOM occlusion at player-area centre: alpha=0.000
+[native-smoke] RESULT: 10/10 passed
+[native-smoke] PASS — VLC native verified
+```
 
 Expected `[native-smoke]` checks (the VLC contract that matters, in code order):
 1. libvlc session initialized (`VlcSession::new`, `VLC_PLUGIN_PATH` applied)
@@ -127,26 +161,29 @@ Verdict printed per run: `[native-smoke] RESULT: N/10 passed` →
 
 ## 7. Acceptance criteria (§17)
 
-Status at this revision — **8–13 verified by automated suites**, runtime-heavy
-criteria blocked on the pending smoke (§6):
+Status at this revision — **10/13 verified by automated suites or the live
+smoke**; the two interactive-UI runtime criteria (5, 7) are real-manual-path
+items not exercised by the slim battery:
 
 1. ✅ siblings / no bleed (`videoLayout.test.ts`, `VideoPlayer.test.tsx` A–L)
 2. ✅ rect==viewport verbatim (reporter tests, `vlc_set_layout` unit contract)
 3. ✅ engine XOR (test `[A]`)
-4. ✅ webview-on-top (code path + layering arms; runtime occlusion is smoke #10)
-5. ⏳ sidebar-toggle re-anchor — blocked on live smoke (resize/re-flow covered by tests)
+4. ✅ webview-on-top (code path + layering arms; runtime occlusion proven live — smoke #10)
+5. ⏳ sidebar-toggle re-anchor — not in the slim battery (resize/re-flow covered by tests); needs a live product-path toggle run
 6. ✅ resize exact + degenerate skip (tests `[C]`,`[D]`,`[E]` + `sanitize_surface_layout`)
-7. ⏳ fullscreen re-anchor — blocked on live smoke
+7. ⏳ fullscreen re-anchor — not in the slim battery; needs a live `set_window_fullscreen` run
 8. ✅ `vlc-embed-lost`/watchdog → HTML5 (tests `[I]`,`[J]`)
-9. ⏳ `applied_js_rect` vs DOM stage + DOM alpha — blocked on live smoke
+9. ✅ `applied_js_rect` vs DOM stage + DOM alpha — proven live (smoke checks 9 + 10, `actual host 848x760 at (352,40)`, `alpha=0.000`)
 10. ✅ forbidden architecture scan (§3)
 11. ✅ reporter idles once anchored (test `[C]`)
 12. ✅ sidebar `opacity-100` opaque invariant (test `[L]`)
 13. ✅ player root + controls bar `isolate` self-containment (test `[K]`)
 
-> Closing verdict for the migration today: **PASS on architecture/unit/build
-> verification; the runtime smoke (criteria 5, 7, 9) is recorded as PENDING** —
-> the canonical model itself is unchanged and its invariants are machine-checked.
+> Closing verdict for the migration today: **PASS** — architecture/unit/build
+> verification and the live macOS smoke battery (10/10) are all green after the
+> `f9b1f42` crash fixes; the only remaining runtime gaps are the interactive
+> sidebar-toggle and fullscreen re-anchor checks (criteria 5 and 7), which the
+> slim harness does not drive.
 
 ## 8. Deliverables
 
@@ -157,4 +194,6 @@ criteria blocked on the pending smoke (§6):
 - `src-tauri/src/native_player/session.rs` / `mod.rs` — VLC session, host NSView,
   `vlc_*` command surface, slim smoke harness
 - `Todo.md` — migration entry published (P0#2)
-- Fresh `ZanPlayer Lite.app` with `--features vlc-native` + live smoke: **PENDING**
+- Fresh `ZanPlayer Lite.app` with `--features vlc-native` + live smoke: **DONE —
+  10/10 passed (2026-09-17)** via the dev binary; a packaged `.app` re-run + MKV
+  corpus remain as follow-ups (see `Todo.md`)

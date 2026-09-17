@@ -1,6 +1,6 @@
 {
   "productName": "ZanPlayer Lite",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "identifier": "com.micropsy.zanplayer-lite",
   "build": {
     "beforeDevCommand": "npm run dev",

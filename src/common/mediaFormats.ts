@@ -114,7 +114,7 @@ export const subtitleAcceptString = (): string =>
 
 // Containers the built-in HTML5 <video>/<audio> engines can actually demux.
 // WebKit/Safari cannot demux Matroska (.mkv), AVI, FLV or ASF (.wmv) at all;
-// Chromium only plays a narrow codec subset inside MKV. The native mpv engine
+// Chromium only plays a narrow codec subset inside MKV. The native VLC engine
 // handles every cataloged container, so these surfaces are only hit when the
 // native engine is unavailable (PWA/web, or a desktop build without the
 // feature) — where a silent black frame is worse than a clear message.
@@ -130,9 +130,22 @@ export const isHtml5Playable = (fileName: string): boolean => {
   );
 };
 
-/** Human-readable hint when a container can't play on the fallback engine. */
-export const html5UnsupportedHint = (fileName: string): string | null => {
+/**
+ * Actionable hint when a container can't play on the fallback engine.
+ * `nativeAvailable` (true when this build ships the native VLC engine AND it
+ * was reachable for the current session) tailors the call-to-action: with
+ * native around, playback already tries VLC first, so an HTML5 failure here
+ * means neither engine decoded it; without it, the shipped build must convert
+ * the file or switch to a native-enabled build — never a dead-end error.
+ */
+export const html5UnsupportedHint = (
+  fileName: string,
+  nativeAvailable = false
+): string | null => {
   if (!isMediaFile(fileName)) return null;
   if (isHtml5Playable(fileName)) return null;
-  return `"${fileName}" uses a ${extensionOf(fileName).toUpperCase()} container that this fallback player can't decode. Convert it to MP4/WebM or use the native engine.`;
+  const ext = extensionOf(fileName).toUpperCase();
+  return nativeAvailable
+    ? `"${fileName}" uses a ${ext} container that neither engine here could decode. Convert it to MP4/WebM (H.264) and try again.`
+    : `"${fileName}" uses a ${ext} container this fallback player can't decode. Convert it to MP4/WebM, or use a ZanPlayer build with the native engine enabled.`;
 };

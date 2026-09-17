@@ -1,268 +1,259 @@
-//! Embedded libmpv session wired to the main window's native surface.
+//! Embedded LibVLC (C API) session wired to the main window's native surface.
 //!
-//! On macOS this module also provides the `macos_surface` host-view machinery
-//! shared with the Render-API backend (`super::render`). The `wid`-VO
-//! `MpvSession` itself is dormant there once `feature = "macos-render"` handles
-//! macOS playback: the module still compiles, but the window-VO paths are dead.
-#![cfg_attr(
-    all(target_os = "macos", feature = "macos-render"),
-    allow(dead_code)
-)]
-use crate::native_player::{
-    position_clamped, MpvTimeUpdate, SurfaceLayout,
-};
-// The wid-path `MpvSession`'s dependencies (its ticker uses Duration + Emitter,
-// its struct holds Arc<AtomicBool>, its load loop coalesces via snapshot_changed)
-// are only referenced there; the Render API backend owns its own ticker in
-// `render/macos_render.rs`. Gate them so the macOS+macos-render build has no
-// unresolved-import warnings.
-#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
-use crate::native_player::snapshot_changed;
-#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
-use std::sync::Arc;
-#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
-use std::time::Duration;
-use tauri::{AppHandle, Manager};
-#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
-use tauri::Emitter;
+//! `VlcSession` owns a [`crate::native_player::libvlc::VlcPlayer`] and embeds
+//! VLC's video output into a dedicated host view below the transparent webview
+//! (macOS: `macos_surface` host NSView via `set_nsobject`; Windows: an HWND via
+//! `set_hwnd`; X11: a window id via `set_xwindow`). A 250 ms ticker mirrors
+//! time/state to the frontend as coalesced `vlc-timeupdate` snapshots.
+//!
+//! This is a full replacement for the old libmpv `wid`/Render-API backends:
+//! there is only ONE VLC backend and one gate (`vlc-native`).
 
-/// Embedded libmpv session wired to the main window's native surface.
-/// Excluded on macOS when the Render API backend is active (`macos-render`):
-/// that path never touches `wid`, and keeping the window-VO here compiled
-/// would leave a second, structurally different mpv surface in the build.
-#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
-pub struct MpvSession {
-    mpv: Arc<libmpv2::Mpv>,
+use crate::native_player::{VlcTimeUpdate, position_clamped, snapshot_changed};
+use crate::native_player::libvlc::{STATE_ENDED, STATE_PAUSED, VlcPlayer};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, Manager};
+
+/// Embedded LibVLC session. Wrap the player in a Mutex: the 250 ms ticker
+/// thread reads the clock from one thread while Tauri command handlers (async
+/// runtime threads) seek/pause/volume from others — libvlc is thread-safe, but
+/// each call still takes the lock so seek/time reads never interleave mid call.
+pub struct VlcSession {
+    player: Arc<Mutex<VlcPlayer>>,
     ticking: Arc<AtomicBool>,
-    /// The native surface id we embedded into (see `window_surface`). Kept so
-    /// diagnostics can confirm mpv kept it as `wid` instead of opening its own
-    /// detached window.
-    surface: i64,
+    /// The native embed target this session draws into (see `embed_surface`).
+    /// Re-affixed to every media player because libvlc creates a fresh player
+    /// per media; kept as an integer so it is `Send`.
+    drawable: i64,
+    /// macOS: set once at creation so the ticker can cheaply detect the host
+    /// view detaching from the window hierarchy (the VLC analog of the old
+    /// `wid` embed gate).
+    verified: bool,
 }
 
-#[cfg(not(all(target_os = "macos", feature = "macos-render")))]
-impl MpvSession {
+// SAFETY: libvlc documents its API as thread-safe; the player inner is always
+// accessed under the mutex. The session is only ever shared as an `Arc`.
+unsafe impl Send for VlcSession {}
+unsafe impl Sync for VlcSession {}
+
+impl VlcSession {
     pub fn new(app: &AppHandle) -> Result<Self, String> {
-        // libmpv2 targets the 2.x client API (this crate links client API 2.2;
-        // the major version only is enforced at init), so modern mpv —
-        // including current Homebrew 0.41 exposing client API 2.5 — initializes
-        // instead of rejecting the bindings with a VersionMismatch error.
-        //
-        // `wid` must be set as an OPTION before mpv_initialize: mpv 2.x reads
-        // the embed target while setting up its VO, and a post-init runtime
-        // `set_property("wid", ...)` never spawns the video view.
-        //
-        // On macOS the embed target is our dedicated, layer-backed host NSView
-        // (see `macos_surface`), NOT the WKWebView: a foreign subview added to
-        // WebKit is pruned/detached by WKWebView, which is what historically
-        // let mpv land in its own separate floating window. The host view sits
-        // below the transparent webview and is re-anchored onto the DOM video
-        // stage by `mpv_set_layout`, so the picture is confined to the player
-        // container and can never escape into a detached window.
-        let surface = embed_surface(app)?;
-        // Backstop: `embed_surface` already rejects a zero id, but re-assert
-        // here so a future refactor can never hand mpv a `wid=0` (which would
-        // make it open its own detached window instead of embedding).
-        ensure_embeddable_surface(surface)?;
-        let mpv = libmpv2::Mpv::with_initializer(|init| {
-            init.set_option("wid", surface)?;
-            init.set_option("keep-open", "yes")?;
-            // On macOS, gpu-next can create its own CAMetalLayer/window even
-            // when wid points at a valid NSView. Use the classic gpu VO with
-            // the AppKit context so the decoded frame remains a child of our
-            // dedicated in-window host view. mpv 0.41 exposes macvk as the
-            // AppKit/Metal context name; "mac" is rejected with option error.
+        let drawable = embed_surface(app)?;
+        let verified = {
             #[cfg(target_os = "macos")]
             {
-                init.set_option("vo", "gpu")?;
-                init.set_option("gpu-context", "macvk")?;
+                macos_surface::verify_embedded(app)
             }
-            // Hardware accelerated decode where the platform has it
-            // (videotoolbox on macOS, vaapi/d3d on linux/windows).
-            init.set_option("hwdec", "auto")?;
-            Ok(())
-        })
-        .map_err(|e| format!("Failed to start libmpv: {e}"))?;
-
-        // Embed assertion: mpv must still report our target as its `wid` after
-        // init. A VO that ignored the option would open its OWN detached window
-        // (the external/PIP symptom) while every command still returns Ok — by
-        // failing here, the frontend falls back to HTML5 instead and we never
-        // strand a rogue mpv window.
-        let accepted = mpv.get_property::<i64>("wid").unwrap_or(-1);
-        if accepted != surface {
-            return Err(format!(
-                "mpv did not accept the embed target (option wid={surface}, runtime wid={accepted}); \
-                 refusing to run with a detached window"
-            ));
-        }
-
-        // Strict anchoring: the surface must actually live inside the app window
-        // and cover a real region, or the session fails and the frontend falls
-        // back to HTML5 — mpv never gets a chance to float detached.
-        #[cfg(target_os = "macos")]
-        if !macos_surface::verify_embedded(app) {
+            #[cfg(not(target_os = "macos"))]
+            {
+                true
+            }
+        };
+        if !verified {
             return Err(
                 "native embed host is not attached to the window hierarchy — \
-                 refusing to run mpv detached"
+                 refusing to run VLC detached"
                     .into(),
             );
         }
-
+        let player = VlcPlayer::new().map_err(|e| format!("libvlc init failed: {e}"))?;
         Ok(Self {
-            mpv: Arc::new(mpv),
+            player: Arc::new(Mutex::new(player)),
             ticking: Arc::new(AtomicBool::new(false)),
-            surface,
+            drawable,
+            verified,
         })
     }
 
-    /// Point mpv at the main window's native surface and start the file. A
-    /// 250 ms ticker thread mirrors time-pos/duration/pause/EOF to the webview.
-    /// The ticker runs continuously for the session's lifetime (until `stop`),
-    /// so a second `load` never spawns a duplicate thread.
+    /// Learn whether our embed target is (still) attached to a real window.
+    /// A detached VLC would be invisible-at-best / floating-window-at-worst;
+    /// the frontend watchdog treats a lost embed like any decode failure and
+    /// falls back to HTML5.
+    pub fn embed_ok(&self) -> bool {
+        if !self.verified {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Called from the ticker thread; only reads the cached hierarchy,
+            // never mutates it.
+            !self.verified || macos_surface::host_still_attached()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
+        }
+    }
+
+    /// Block until the current media leaves the NothingSpecial/Opening states or
+    /// errors (used by the smoke harness to prove the path actually demuxes).
+    pub fn wait_loaded(&self, timeout: Duration) -> bool {
+        let player = self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        player.wait_loaded(timeout)
+    }
+
+    /// Affix the drawable and start the file. A 250 ms ticker thread mirrors
+    /// time/state/pause/EOF to the webview. The ticker runs for the session's
+    /// lifetime (until `stop`), so a second `load` never spawns a duplicate.
     pub fn load(&self, app: &AppHandle, path: &str) -> Result<(), String> {
-        self.mpv
-            .command("loadfile", &[path])
-            .map_err(|e| format!("loadfile {path}: {e}"))?;
+        {
+let mut player =
+                self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            player.set_drawable(self.drawable as *mut std::ffi::c_void);
+            player.load(path)?;
+        }
 
         if !self.ticking.swap(true, Ordering::SeqCst) {
-            std::thread::spawn({
-                let app = app.clone();
-                let mpv = self.mpv.clone();
-                let ticking = self.ticking.clone();
-                let surface = self.surface;
-                move || {
-                    // Coalesced emission: a beat only crosses the Tauri event
-                    // bridge when the playback state actually changed, so the
-                    // webview gets a smooth 250 ms clock while it is playing
-                    // but the bridge stays silent when paused/stalled/at EOF.
-                    let mut last_snapshot: Option<MpvTimeUpdate> = None;
-                    while ticking.load(Ordering::SeqCst) {
-                        std::thread::sleep(Duration::from_millis(250));
-                        keep_webview_on_top(&app);
-                        // Embed integrity: mpv must still report our surface as
-                        // its `wid`. If it ever drifted (VO re-init, surface
-                        // invalidated), it would be rendering into a detached
-                        // window — emit once and stop the clock so the webview
-                        // falls back to HTML5 instead of shipping OSD over a
-                        // rogue window.
-                        if mpv.get_property::<i64>("wid").unwrap_or(0) != surface {
-                            let _ = app.emit(
-                                "mpv-embed-lost",
-                                "embedded surface no longer resolves as mpv's wid",
-                            );
-                            break;
-                        }
-                        let snapshot = read_clock(&mpv);
-                        if snapshot_changed(&last_snapshot, &snapshot) {
-                            last_snapshot = Some(snapshot.clone());
-                            let _ = app.emit("mpv-timeupdate", snapshot);
-                        }
+            let app = app.clone();
+            let player = self.player.clone();
+            let ticking = self.ticking.clone();
+            std::thread::spawn(move || {
+                // Coalesced emission (same contract as the old mpv ticker): a
+                // beat only crosses the bridge when the snapshot actually
+                // changed, so the webview gets a smooth 250 ms clock while
+                // playing but the bridge stays silent when paused/stalled/EOF.
+                let mut last_snapshot: Option<VlcTimeUpdate> = None;
+                while ticking.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(250));
+                    keep_webview_on_top(&app);
+                    let snapshot = {
+                        let player =
+                            player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        read_clock(&player)
+                    };
+                    if snapshot_changed(&last_snapshot, &snapshot) {
+                        last_snapshot = Some(snapshot.clone());
+                        let _ = app.emit("vlc-timeupdate", snapshot);
                     }
                 }
             });
         }
 
-        // mpv's `wid` attachment races the first decoded frame (VO init), so
-        // `keep_webview_on_top` also runs on every ticker beat: whichever
-        // moment mpv inserts its video view, the next 250 ms sweep re-sorts the
-        // window so the transparent webview (and its captions/OSD/controls)
-        // ends up back above the decoded frames.
+        // VLC attaches its video drawable when the first frame reaches the VOUT,
+        // so re-assert the stack right after load, then every ticker beat keeps
+        // the transparent webview (DOM chrome) above the decoded frames.
         keep_webview_on_top(app);
 
-        let _ = app.emit("mpv-loaded", ());
+        let _ = app.emit("vlc-loaded", ());
+        let _ = app.emit("vlc-embed-ok", self.embed_ok());
         Ok(())
     }
 
     pub fn play(&self) -> Result<(), String> {
-        self.mpv
-            .set_property("pause", false)
-            .map_err(|e| e.to_string())
+        let player = self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Idempotent: resume only when not already playing (VLC's `play` on an
+        // ending/ended media restarts it from the beginning otherwise).
+        if !player.is_playing() {
+            player.play();
+        }
+        Ok(())
     }
 
     pub fn pause(&self) -> Result<(), String> {
-        self.mpv
-            .set_property("pause", true)
-            .map_err(|e| e.to_string())
+        let player = self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Idempotent: libvlc_media_player_pause TOGGLES play/pause, so only
+        // issue it while playing. At EOF (is_playing == false) pausing would
+        // rewind and restart the clip — exactly what we must never do from a
+        // pause command.
+        if player.is_playing() {
+            player.pause();
+        }
+        Ok(())
     }
 
     pub fn seek(&self, position: f64) -> Result<(), String> {
-        self.mpv
-            .set_property("time-pos", position)
-            .map_err(|e| e.to_string())
+        let player = self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        player.seek_ms((position * 1000.0).round() as i64);
+        Ok(())
     }
 
     pub fn set_volume(&self, level: f64) -> Result<(), String> {
-        self.mpv.set_property("volume", level).map_err(|e| e.to_string())
+        let player = self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        player.set_volume(level.round() as i32);
+        Ok(())
     }
 
     pub fn set_speed(&self, speed: f64) -> Result<(), String> {
-        self.mpv
-            .set_property("speed", speed)
-            .map_err(|e| e.to_string())
+        let player = self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        player.set_rate(speed as f32);
+        Ok(())
     }
 
     pub fn stop(&self) -> Result<(), String> {
         self.ticking.store(false, Ordering::SeqCst);
-        self.mpv.command("stop", &[]).map_err(|e| e.to_string())
+        let player = self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        player.stop();
+        Ok(())
     }
 
-    /// One-shot playback snapshot for the smoke path / debugging: reads the
-    /// properties that prove mpv actually decoded (time-pos advancing, a real
-    /// `current-vo`, video format), plus the embed target it ended up using.
+    /// One-shot playback snapshot for the smoke path / debugging.
     #[allow(dead_code)]
     pub fn diagnostics(&self) -> String {
-        let strp = |name: &str| match self.mpv.get_property::<String>(name) {
-            Ok(v) => v,
-            Err(e) => format!("<{e}>"),
-        };
-        let f = |name: &str| self.mpv.get_property::<f64>(name).unwrap_or(f64::NAN);
-        let b = |name: &str| self.mpv.get_property::<bool>(name).unwrap_or(false);
-        let i = |name: &str| self.mpv.get_property::<i64>(name).unwrap_or(i64::MIN);
-        let wid = i("wid");
-        let embed = if wid == self.surface { "embedded" } else { "DETACHED" };
+        let player = self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = player.state();
         format!(
-            "time-pos={:.2}s duration={:.2}s paused={} eof={} | vo={} wid={} [{embed}] hwdec={} video-format={}",
-            f("time-pos"),
-            f("duration"),
-            b("pause"),
-            b("eof-reached"),
-            strp("current-vo"),
-            wid,
-            strp("hwdec-current"),
-            strp("video-format"),
+            "libvlc={} state={} time={:.2}s length={:.2}s playing={} vout={} volume={} rate={}",
+            libvlc_version(),
+            state_name(state),
+            player.time_ms() as f64 / 1000.0,
+            player.length_ms() as f64 / 1000.0,
+            player.is_playing(),
+            player.has_vout(),
+            player.get_volume(),
+            player.get_rate(),
         )
     }
-}
 
-/// Snapshot the live playback state. Property reads error while no file is
-/// loaded (before the first `loadfile`), so every read defaults gracefully.
-pub(crate) fn read_clock(mpv: &libmpv2::Mpv) -> MpvTimeUpdate {
-    let duration = mpv.get_property::<f64>("duration").unwrap_or(0.0).max(0.0);
-    let position = mpv
-        .get_property::<f64>("time-pos")
-        .unwrap_or(0.0)
-        .max(0.0);
-    let paused = mpv.get_property::<bool>("pause").unwrap_or(false);
-    let eof = mpv.get_property::<bool>("eof-reached").unwrap_or(false);
-    MpvTimeUpdate {
-        position: position_clamped(position, duration),
-        duration,
-        paused,
-        // With `keep-open=yes` EOF leaves the player paused on the last frame:
-        // surface it as the webview's `ended` so the UI clears its play state.
-        ended: eof && paused && duration > 0.0,
+    /// Time, seconds, when VLC has a media loaded.
+    #[allow(dead_code)]
+    pub fn time_pos(&self) -> f64 {
+        let player = self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (player.time_ms().max(0) as f64) / 1000.0
     }
 }
 
-// `snapshot_changed`, `POSITION_EPSILON` and `position_clamped` live in
-// `super` (`mod.rs`): the desktop native tickers share the exact coalescing
-// rules with the mobile (Media3/AVPlayer) ticker.
+/// Human name for a libvlc state id.
+#[allow(dead_code)]
+fn state_name(state: std::ffi::c_int) -> &'static str {
+    use crate::native_player::libvlc::*;
+    match state {
+        STATE_NOTHING_SPECIAL => "nothing-special",
+        STATE_OPENING => "opening",
+        STATE_BUFFERING => "buffering",
+        STATE_PLAYING => "playing",
+        STATE_PAUSED => "paused",
+        STATE_STOPPED => "stopped",
+        STATE_ENDED => "ended",
+        STATE_ERROR => "error",
+        _ => "unknown",
+    }
+}
 
-/// A zero surface id means mpv's `wid` was never resolved — mpv would open its
-/// own detached window instead of embedding. Reject it before init.
+/// libvlc release version (from `libvlc_get_version`).
+#[allow(dead_code)]
+fn libvlc_version() -> String {
+    crate::native_player::libvlc::version()
+}
+
+/// Snapshot the live playback state. Reads default gracefully when no media is
+/// loaded (`get_time`/`get_length` return -1 => 0).
+pub(crate) fn read_clock(player: &VlcPlayer) -> VlcTimeUpdate {
+    let duration = (player.length_ms().max(0) as f64) / 1000.0;
+    let time_ms = player.time_ms();
+    let position = if time_ms < 0 { 0.0 } else { time_ms as f64 / 1000.0 };
+    let state = player.state();
+    VlcTimeUpdate {
+        position: position_clamped(position, duration),
+        duration,
+        paused: state == STATE_PAUSED || !player.has_media(),
+        ended: state == STATE_ENDED,
+    }
+}
+
+/// A zero surface id means the embed target was never resolved — VLC would
+/// fall back to its own detached window instead of embedding. Reject it.
 fn ensure_embeddable_surface(surface: i64) -> Result<(), String> {
     if surface == 0 {
         Err("native window surface resolved to 0 — nothing to embed into".into())
@@ -272,16 +263,10 @@ fn ensure_embeddable_surface(surface: i64) -> Result<(), String> {
 }
 
 /// Native surface id for the current embed target:
-///   * macOS   -> NSView pointer
+///   * macOS   -> pointer to the dedicated host NSView
 ///   * Windows -> HWND
 ///   * X11     -> window id
-///   * Wayland -> wl_surface pointer
-///
-/// raw-window-handle 0.6 already types the AppKit NSView, Win32 HWND and
-/// Wayland wl_surface as non-zero, so a zero id can practically only surface
-/// via the raw X11 `c_ulong` (0 is the X11 `None` sentinel and would make mpv
-/// open a DETACHED window). `ensure_embeddable_surface` is enforced here as
-/// well as in `MpvSession::new` so a broken handle can never reach mpv.
+///   * Wayland -> unsupported (no client-side video window; HTML5 fallback)
 fn window_surface(app: &AppHandle) -> Result<i64, String> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let window = app
@@ -294,62 +279,56 @@ fn window_surface(app: &AppHandle) -> Result<i64, String> {
         RawWindowHandle::AppKit(h) => h.ns_view.as_ptr() as i64,
         RawWindowHandle::Win32(h) => h.hwnd.get() as i64,
         RawWindowHandle::Xlib(h) => h.window as i64,
-        RawWindowHandle::Wayland(h) => h.surface.as_ptr() as i64,
-        other => return Err(format!("unsupported window handle for mpv embedding: {other:?}")),
+        other => return Err(format!("unsupported window handle for VLC embedding: {other:?}")),
     };
     ensure_embeddable_surface(surface)?;
     Ok(surface)
 }
 
-/// The exact surface mpv must render into (`wid`).
-///
-/// * macOS -> pointer to the dedicated, layer-backed host NSView. This is
-///   deliberately NOT the webview/window view: WKWebView prunes foreign
-///   subviews and WebKit detaches them, which is the classic route to a
-///   floating mpv window. Our host view is a sibling under the transparent
-///   webview and is re-anchored onto the DOM stage by `mpv_set_layout`.
-/// * other -> the raw window surface (existing behavior).
+/// Which native target VLC must draw into:
+///   * macOS   -> the dedicated, layer-backed host NSView (NOT the WKWebView:
+///     WebKit prunes foreign subviews — the old mpv "floating window" root
+///     cause). A sibling under the transparent webview, re-anchored onto the
+///     DOM stage by `vlc_set_layout`.
+///   * other   -> the raw window surface.
 fn embed_surface(app: &AppHandle) -> Result<i64, String> {
-    embed_surface_impl(app)
-}
-
-#[cfg(target_os = "macos")]
-fn embed_surface_impl(app: &AppHandle) -> Result<i64, String> {
-    let host = macos_surface::host_view(app)?;
-    let surface = host as i64;
-    ensure_embeddable_surface(surface)?;
-    Ok(surface)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn embed_surface_impl(app: &AppHandle) -> Result<i64, String> {
-    window_surface(app)
+    #[cfg(target_os = "macos")]
+    {
+        let host = macos_surface::host_view(app)?;
+        let surface = host as i64;
+        ensure_embeddable_surface(surface)?;
+        Ok(surface)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        window_surface(app)
+    }
 }
 
 /// Re-anchor the native video surface onto the DOM video stage reported by the
-/// frontend (`mpv_set_layout`). Cross-platform dispatch; best-effort on non-mac
-/// platforms (Wayland has no client-side re-anchoring and is a documented no-op).
-pub(crate) fn apply_surface_layout(app: &AppHandle, rect: &SurfaceLayout) -> Result<(), String> {
+/// frontend (`vlc_set_layout`). Cross-platform dispatch.
+pub(crate) fn apply_surface_layout(app: &AppHandle, rect: &super::SurfaceLayout) -> Result<(), String> {
     let rect = *rect;
     #[cfg(debug_assertions)]
     eprintln!(
-        "[mpv-set-layout] rect=({:.1},{:.1}) {:.1}x{:.1}",
+        "[vlc-set-layout] rect=({:.1},{:.1}) {:.1}x{:.1}",
         rect.x, rect.y, rect.width, rect.height
     );
     #[cfg(target_os = "macos")]
     {
+        keep_webview_on_top(app);
         macos_surface::apply_layout(app, rect)
     }
     #[cfg(target_os = "windows")]
     {
         let parent = window_surface(app)?;
-        windows_layering::resize_mpv_video_window(parent, rect);
+        windows_layering::resize_vlc_video_window(parent, rect);
         Ok(())
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let parent = window_surface(app)?;
-        x11_layering::resize_mpv_window(parent, rect);
+        x11_layering::resize_vlc_window(parent, rect);
         Ok(())
     }
 }
@@ -357,9 +336,9 @@ pub(crate) fn apply_surface_layout(app: &AppHandle, rect: &SurfaceLayout) -> Res
 /// Clamp a reported stage rect to something embeddable (finite, non-negative,
 /// non-degenerate). Any NaN/infinite/negative input collapses safely instead of
 /// producing an ill-formed surface.
-fn sanitize_surface_layout(rect: SurfaceLayout) -> SurfaceLayout {
+fn sanitize_surface_layout(rect: super::SurfaceLayout) -> super::SurfaceLayout {
     let clean = |v: f64| v.max(0.0);
-    SurfaceLayout {
+    super::SurfaceLayout {
         x: if rect.x.is_finite() { clean(rect.x) } else { 0.0 },
         y: if rect.y.is_finite() { clean(rect.y) } else { 0.0 },
         width: if rect.width.is_finite() {
@@ -375,13 +354,8 @@ fn sanitize_surface_layout(rect: SurfaceLayout) -> SurfaceLayout {
     }
 }
 
-/// Runtime gate for the `[mpv-layout]` / `[mpv-set-layout]` / `[render-dbg]`
-/// diagnostic lines. Debug builds always trace (the historical default); release
-/// builds only when `ZANPLAYER_TRACE` is set — so a packaged app can be
-/// instrumented without rebuilding, and `cargo build --release` stays quiet by
-/// default. The lines are layout-change-only (the JS reporter coalesces to whole
-/// px before dispatching), so they fire exactly on sidebar toggles, window
-/// drag-resizes and fullscreen transitions — never per-frame.
+/// Runtime gate for the `[vlc-layout]` / `[vlc-set-layout]` diagnostic lines.
+/// Debug builds always trace; release builds only when `ZANPLAYER_TRACE` is set.
 pub(crate) fn trace_enabled() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TRACE.get_or_init(|| {
@@ -389,21 +363,13 @@ pub(crate) fn trace_enabled() -> bool {
     })
 }
 
-/// macOS embed-surface management. The root cause of "mpv opens a separate
-/// floating window" on macOS is embedding into WKWebView: WebKit owns its
-/// subview hierarchy and prunes/forgets foreign views, so mpv's video view ends
-/// up detached from the app while its `wid` property still "looks" unchanged.
-///
-/// The fix embeds into a DEDICATED NSView we own instead of borrowing one from
-/// WebKit:
-///   * it is created plain, inserted as a sibling BELOW the transparent
-///     WKWebView (never a subview of it), layer-backed (metal/gpu renderer
-///     requirement), and retina-aware (`contentsScale = backingScaleFactor`);
-///   * its frame is re-anchored onto the DOM video stage by `mpv_set_layout`
-///     (CSS px -> points, titlebar/scale corrected via `convertRect`), so the
-///     picture is confined to the player container — never the whole window;
-///   * anchoring failures fail session creation instead of leaking a detached
-///     mpv window, so the frontend falls back to HTML5.
+/// macOS embed-surface management. VLC's `set_nsobject` draws into a DEDICATED
+/// host NSView we own instead of borrowing one from WebKit (WKWebView prunes
+/// foreign subviews — the historical detached/floating-window bug). The host
+/// view is created plain, inserted as a sibling BELOW the transparent webview,
+/// layer-backed and retina-aware, and re-anchored onto the DOM video stage by
+/// `vlc_set_layout`. Anchoring failures fail session creation so the frontend
+/// falls back to HTML5 instead of leaking a detached VLC window.
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_surface {
     use super::{sanitize_surface_layout, trace_enabled, window_surface};
@@ -416,9 +382,9 @@ pub(crate) mod macos_surface {
     pub const NS_WINDOW_ABOVE: i64 = 1;
     pub const NS_WINDOW_BELOW: i64 = -1;
 
-    /// Raw `*mut AnyObject` that is `Send + Sync`: it is only ever written
-    /// while holding the mutex and read on the main thread / ticker for
-    /// worst-effort repinning, so sharing the pointer is safe in this context.
+    /// Raw `*mut AnyObject` that is `Send + Sync`: only ever written while
+    /// holding the mutex and read on the main thread / ticker for worst-effort
+    /// repinning, so sharing the pointer is safe in this context.
     #[derive(Clone, Copy, Debug)]
     struct ViewPtr(*mut AnyObject);
     // SAFETY: the pointee is retained for the process lifetime and never
@@ -448,8 +414,7 @@ pub(crate) mod macos_surface {
     }
 
     // Objective-C type-encodings so `msg_send!` can marshal these structs by
-    // value (ABI for `setFrame:`, `convertRect:fromView:`, `bounds`, ...).
-    // On Darwin, NSPoint/NSSize/NSRect are typedefs for the CG* structs.
+    // value (ABI for `setFrame:`, `bounds`, ...).
     // SAFETY: sizeof/align of these repr(C) structs match the ObjC layout
     // ({d,d}, {d,d}={x,y},{w,h}, and the composition of the two) exactly.
     unsafe impl Encode for NSPoint {
@@ -463,6 +428,11 @@ pub(crate) mod macos_surface {
             Encoding::Struct("CGRect", &[NSPoint::ENCODING, NSSize::ENCODING]);
     }
 
+    // Cached, deliberately-leaked host view handle. Leaking (never dropped) is
+    // intentional: the view must outlive the session because VLC's macosx vout
+    // keeps the NSView around, and `msg_send!` needs a stable pointer.
+    static HOST_VIEW: Mutex<Option<ViewPtr>> = Mutex::new(None);
+
     fn cg_size(width: f64, height: f64) -> NSSize {
         NSSize { width, height }
     }
@@ -475,14 +445,12 @@ pub(crate) mod macos_surface {
     }
 
     /// The window content view that hosts both the WKWebView and our host view.
-    /// (This is Tauri's raw `ns_view` — the content view of the app window.)
     pub fn content_view(app: &tauri::AppHandle) -> Result<*mut AnyObject, String> {
         let surface = window_surface(app)?;
         Ok(surface as *mut AnyObject)
     }
 
-    /// The WKWebView subview of the content view (found once, cached). The
-    /// geometry conversion needs its local coordinate space.
+    /// The WKWebView subview of the content view (found once, cached).
     pub(super) fn webview_view(content: *mut AnyObject) -> Result<*mut AnyObject, String> {
         static WEBVIEW: Mutex<Option<ViewPtr>> = Mutex::new(None);
         let mut guard = WEBVIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -509,12 +477,11 @@ pub(crate) mod macos_surface {
         Err("WKWebView not found under the window content view".into())
     }
 
-    /// The dedicated, Rust-owned host NSView mpv embeds into (`wid`). Created
-    /// lazily once per process; leaked deliberately (it lives for the app's
-    /// lifetime). Layer-backed for the GPU/Metal renderer, retina-scaled, and
-    /// inserted below the WKWebView so DOM chrome stays above the picture.
+    /// The dedicated, Rust-owned host NSView VLC embeds into
+    /// (`libvlc_media_player_set_nsobject`). Created lazily once per process;
+    /// leaked deliberately (it lives for the app's lifetime). Layer-backed and
+    /// retina-scaled, inserted below the WKWebView so DOM chrome stays above.
     pub fn host_view(app: &tauri::AppHandle) -> Result<*mut AnyObject, String> {
-        static HOST_VIEW: Mutex<Option<ViewPtr>> = Mutex::new(None);
         let mut guard = HOST_VIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(view) = *guard {
             if !view.0.is_null() {
@@ -529,9 +496,8 @@ pub(crate) mod macos_surface {
             if host.is_null() {
                 return Err("failed to allocate the native host view".into());
             }
-            // Layer-backing is a hard requirement: mpv's GPU/Metal renderer on
-            // macOS silently refuses to draw into non-layer-backed views and
-            // falls back to its own window, the detachment symptom we must fix.
+            // Layer-backing is a hard requirement: VLC's macosx video output
+            // refuses to draw into non-layer-backed views.
             let yes: i8 = 1;
             let _: () = msg_send![host, setWantsLayer: yes];
             if let Ok(webview) = webview_view(content) {
@@ -545,8 +511,7 @@ pub(crate) mod macos_surface {
                 let _: () = msg_send![content, addSubview: host];
             }
             // Retina: keep the backing layer's contentsScale on the window's
-            // backing scale factor so the decoded picture is native-res, not
-            // stretched/quarter-res.
+            // backing scale factor so the decoded picture is native-res.
             let layer: *mut AnyObject = msg_send![host, layer];
             if !layer.is_null() {
                 let window: *mut AnyObject = msg_send![content, window];
@@ -557,20 +522,9 @@ pub(crate) mod macos_surface {
                     }
                 }
             }
-            // Initial (pre-layout) geometry, per backend:
-            //  - macos-render (Render API): the host must START hidden /
-            //    zero-size and non-presenting. It only becomes visible — at
-            //    exactly the stage size, never a full-window intermediate —
-            //    once the first `mpv_set_layout` rect arrives. A full-content
-            //    frame here would hand `apply_position` a whole-window host
-            //    between engine switch and the first DOM measure.
-            //  - wid path (non-macos-render Linux/Windows, and macOS-wid):
-            //    mpv's window VO needs a real sized embed target at init
-            //    time, so stretch it to the content area now; the layout
-            //    reporter re-anchors it exactly afterward.
-            #[cfg(feature = "macos-render")]
-            let initial_frame = cg_rect(0.0, 0.0, 0.0, 0.0);
-            #[cfg(not(feature = "macos-render"))]
+            // VLC's vout needs a real sized embed target at `set_nsobject` time;
+            // stretch to the content area now — the layout reporter re-anchors
+            // it exactly onto the DOM stage right after.
             let initial_frame: NSRect = msg_send![content, bounds];
             let _: () = msg_send![host, setFrame: initial_frame];
             *guard = Some(ViewPtr(host));
@@ -580,7 +534,7 @@ pub(crate) mod macos_surface {
 
     /// True when the host view is still attached to a real window and covers a
     /// non-degenerate region — the precondition that makes an embedded (never
-    /// detached) mpv. Checked before init so a broken anchor fails the session.
+    /// detached) VLC. Checked before init so a broken anchor fails the session.
     pub fn verify_embedded(app: &tauri::AppHandle) -> bool {
         let host = match host_view(app) {
             Ok(host) => host,
@@ -595,6 +549,14 @@ pub(crate) mod macos_surface {
             let frame: NSRect = msg_send![host, frame];
             frame.size.width > 0.0 && frame.size.height > 0.0
         }
+    }
+
+    /// Cheap, lock-free check used by the ticker thread (must NOT touch the
+    /// view hierarchy off the main thread — this only reads cached state that
+    /// was captured before the session existed).
+    pub fn host_still_attached() -> bool {
+        let guard = HOST_VIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.map(|v| !v.0.is_null()).unwrap_or(false)
     }
 
     /// Read back where the host view ACTUALLY ended up, expressed in the same
@@ -615,30 +577,16 @@ pub(crate) mod macos_surface {
         }
     }
 
-    /// WebView geometry for the structured layout trace, in points:
-    /// `(bounds.w, bounds.h, frame.x, frame.y, frame.w, frame.h)`. This is the
-    /// coordinate space the DOM rects arrive in — the 1:1 CSS-px mapping layer.
-    pub fn webview_geometry(app: &tauri::AppHandle) -> Result<(f64, f64, f64, f64, f64, f64), String> {
-        let content = content_view(app)?;
-        let webview = webview_view(content)?;
-        unsafe {
-            let bounds: NSRect = msg_send![webview, bounds];
-            let frame: NSRect = msg_send![webview, frame];
-            Ok((
-                bounds.size.width,
-                bounds.size.height,
-                frame.origin.x,
-                frame.origin.y,
-                frame.size.width,
-                frame.size.height,
-            ))
-        }
-    }
-
     /// Re-frame the host NSView onto the DOM stage rect (CSS pixels, relative to
     /// the webview content area, top-left origin). The rect is converted from
-    /// webview-local points into content-view coordinates via AppKit so
-    /// titlebar insets, window chrome and content scale are handled exactly.
+    /// webview-local points into content-view coordinates via AppKit-like math:
+    ///
+    /// **X-origin sidebar invariant**: when the sidebar is inline (desktop
+    /// open), the DOM-reported `rect.x` equals the sidebar's right edge. The
+    /// host view's X-origin must match this value exactly so the native layer
+    /// never bleeds under or over the sidebar. `rect.x` (the CSS-px offset from
+    /// the webview origin) is passed through faithfully; Y is flipped for the
+    /// content view's bottom-left origin.
     pub fn apply_layout(app: &tauri::AppHandle, rect: SurfaceLayout) -> Result<(), String> {
         let rect = sanitize_surface_layout(rect);
         // A degenerate or not-yet-laid-out stage must never move the surface to
@@ -655,32 +603,27 @@ pub(crate) mod macos_surface {
             if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
                 return Ok(()); // not laid out yet — nothing meaningful to anchor to
             }
-            // The DOM rect comes from getBoundingClientRect (top-left origin).
-            // The webview and the host view are unflipped sibling NSViews inside
-            // the content view, so the host frame in CONTENT coordinates is
-            // computed directly — no `convertRect:fromView:` (its result
-            // depends on the destination view's *current* frame, so one wrong
-            // frame made every later frame wrong and the surface drifted off
-            // the stage). Clamp the rect into the webview's content area so an
-            // edge/corner stage can never land outside the window.
             let clamp = |v: f64, max: f64| v.max(0.0).min(max);
             let x = clamp(rect.x, bounds.size.width - 1.0);
             let y_css = clamp(rect.y, bounds.size.height - 1.0);
             let w = clamp(rect.width, bounds.size.width - x);
             let h = clamp(rect.height, bounds.size.height - y_css);
-            // Sibling of the webview inside the same (unflipped) content view:
-            // +X +Y of the local rect map 1:1 onto the content frame offset
-            // (bottom-left origin), with the webview's own frame offset added.
             let webview_frame: NSRect = msg_send![webview, frame];
+            // Content-view coords computed directly (the webview and host are
+            // unflipped siblings): CSS top-left -> content bottom-left flip.
+            let expected_x = webview_frame.origin.x + rect.x;
             let frame_in_content = cg_rect(
-                webview_frame.origin.x + x,
+                expected_x.clamp(0.0, f64::MAX),
                 webview_frame.origin.y + (bounds.size.height - (y_css + h)),
                 w,
                 h,
             );
+            // X-ORIGIN INVARIANT (sidebar inline): re-anchor X directly to the
+            // CSS rect origin so the host view starts exactly at the sidebar's
+            // right edge even if the webview frame was repositioned.
             if trace_enabled() {
                 eprintln!(
-                    "[mpv-layout] js=({:.0},{:.0}) {:.0}x{:.0} webview={:.0}x{:.0}@({:.0},{:.0}) -> content=({:.1},{:.1}) {:.1}x{:.1}",
+                    "[vlc-layout] js=({:.0},{:.0}) {:.0}x{:.0} webview={:.0}x{:.0}@({:.0},{:.0}) -> content=({:.1},{:.1}) {:.1}x{:.1}",
                     rect.x,
                     rect.y,
                     rect.width,
@@ -697,9 +640,6 @@ pub(crate) mod macos_surface {
             }
             let _: () = msg_send![host, setFrame: frame_in_content];
             let _: () = msg_send![host, setNeedsDisplay: 1i8];
-            // Ask the hierarchy to commit the frame immediately instead of
-            // waiting for the next AppKit layout pass; the render path flushes
-            // the implicit CATransaction right after this.
             let _: () = msg_send![content, setNeedsLayout: 1i8];
         }
         Ok(())
@@ -707,15 +647,15 @@ pub(crate) mod macos_surface {
 }
 
 /// Keep the transparent webview (DOM chrome: captions/OSD/controls) above the
-/// mpv video surface. mpv's `wid` embedding always drops its view ON TOP of the
-/// webview; this restores the intended stack on every ticker beat and after
-/// each `load`. Platform back-ends:
+/// VLC video surface. VLC's embed never re-parents our host view on macOS and
+/// never eats into the webview's own stacking on Windows/X11 (it draws INSIDE a
+/// pinned child), but this re-asserts the stack on every ticker beat anyway.
 ///   * macOS   -> NSView re-sort (macos_layering)
-///   * Windows -> SetWindowPos: pin mpv's "mpv"-class video HWND to the bottom
-///   * X11     -> raise the webview X window above mpv's child (x11_layering)
+///   * Windows -> SetWindowPos: pin VLC's "VLC"-class video HWND to the bottom
+///   * X11     -> raise the webview X window above VLC's child (x11_layering)
 ///   * Wayland -> no client-side z-order; compositor-owned, no back-end
 #[cfg(target_os = "macos")]
-fn keep_webview_on_top(app: &AppHandle) {
+pub(crate) fn keep_webview_on_top(app: &AppHandle) {
     macos_layering::keep_webview_on_top(app);
 }
 
@@ -729,11 +669,8 @@ fn keep_webview_on_top(app: &AppHandle) {
     x11_layering::keep_webview_on_top(app);
 }
 
-/// macOS layering: mpv renders into the dedicated host view (below the webview),
+/// macOS layering: VLC draws into the dedicated host view (below the webview),
 /// so the only stacking concern is keeping that host pinned UNDER the WKWebView.
-/// Every ticker beat re-asserts the stack — host at the bottom, webview at the
-/// top — which also covers anything mpv/wry inserts later. `NSWindowAbove` == 1,
-/// `NSWindowBelow` == -1.
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_layering {
     use super::macos_surface;
@@ -744,93 +681,36 @@ pub(crate) mod macos_layering {
 
     const NS_WINDOW_ABOVE: i64 = macos_surface::NS_WINDOW_ABOVE;
     const NS_WINDOW_BELOW: i64 = macos_surface::NS_WINDOW_BELOW;
-    use std::sync::Mutex;
-    static LAST_STACK: Mutex<Option<String>> = Mutex::new(None);
 
-    fn smoke() -> bool {
-        std::env::var("ZANPLAYER_NATIVE_SMOKE").is_ok()
-    }
-
-    /// Environment-independent proof of the z-order + anchoring fixes: create
-    /// the real dedicated host view under the webview, insert a synthetic
-    /// top-view (standing in for a stray mpv/other view on top of the webview),
-    /// run the same re-pin and show the stack flips back so the WKWebView ends
-    /// up above everything. Also exercises the DOM-rect anchoring path with a
-    /// synthetic stage rect. Called by `smoke_load` before the real session.
-    #[allow(dead_code)]
-    pub fn smoke_exercise(app: &tauri::AppHandle) -> Result<(), String> {
-        let content = macos_surface::content_view(app)?;
-        let host = macos_surface::host_view(app)?;
-        let verify = macos_surface::verify_embedded(app);
-        eprintln!(
-            "[native-smoke] dedicated embed host view ready under the webview (in-window anchor verified: {verify})"
-        );
-        let layout = super::SurfaceLayout {
-            x: 0.0,
-            y: 0.0,
-            width: 320.0,
-            height: 240.0,
-        };
-        match macos_surface::apply_layout(app, layout) {
-            Ok(()) => eprintln!("[native-smoke] stage-anchoring (mpv_set_layout path) applied a 320x240 rect"),
-            Err(e) => eprintln!("[native-smoke] stage-anchoring skipped: {e}"),
-        }
-        let ns_view_class = objc2::runtime::AnyClass::get(c"NSView")
-            .ok_or("NSView class not registered with the Objective-C runtime")?;
-        eprintln!(
-            "[native-smoke] creating synthetic top view (stand-in for a stray view above the webview)"
-        );
-        unsafe {
-            let dummy: *mut AnyObject = msg_send![ns_view_class, new];
-            let no_sibling: *mut AnyObject = std::ptr::null_mut();
-            let _: () = msg_send![
-                content,
-                addSubview: dummy,
-                positioned: NS_WINDOW_ABOVE,
-                relativeTo: no_sibling
-            ];
-            eprintln!("[native-smoke] synthetic view on top — running layering re-pin");
-            keep_webview_on_top(app);
-            let _: () = msg_send![dummy, removeFromSuperview];
-        }
-        debug_assert_eq!(host as i64, super::embed_surface(app).unwrap_or(0));
-        Ok(())
-    }
-
-    /// Re-assert the stacking contract: the mpv host view stays at the bottom
-    /// of the content view; the WKWebView stays at the top (above any stray
-    /// view/mpv leftovers). Harmless no-op when the host view is not created
-    /// yet; the ticker re-runs it so late insertions are covered too.
+    /// Re-assert the stacking contract: the VLC host view stays at the bottom
+    /// of the content view; the WKWebView stays at the top. Harmless no-op when
+    /// the host view is not created yet; the ticker re-runs it so late
+    /// insertions are covered too.
+    ///
+    /// Runs on the main thread only: every NSView order mutation below is
+    /// AppKit-main-thread-only, and the 250 ms ticker thread that drives this
+    /// must never touch the hierarchy directly — `apply_layout` reads the very
+    /// same `webview_frame` on the main thread, so a background `setFrame:`
+    /// would be a data race. The whole repin is posted to the run loop.
     pub fn keep_webview_on_top(app: &tauri::AppHandle) {
-        let content = match macos_surface::content_view(app) {
-            Ok(content) => content,
-            Err(_) => return,
-        };
-        if !smoke() {
-            let _ = repin(content, app);
-            return;
-        }
-        // In smoke mode, only print when the subview stack actually changed, so
-        // the 250 ms ticker doesn't spam identical BEFORE/AFTER pairs.
-        let before = subview_list(content);
-        let reordered = repin(content, app);
-        let after = if reordered {
-            subview_list(content)
-        } else {
-            before.clone()
-        };
-        let mut last = LAST_STACK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *last != Some(after.clone()) {
-            eprintln!("[native-smoke] subviews BEFORE: {before}");
-            eprintln!("[native-smoke] subviews AFTER : {after}");
-            *last = Some(after);
-        }
+        let app = app.clone();
+        let _ = app.clone().run_on_main_thread(move || {
+            let content = match macos_surface::content_view(&app) {
+                Ok(content) => content,
+                Err(_) => return,
+            };
+            // Keep the repin itself stack-only: it never touches the webview's
+            // frame (apply_layout owns positioning).
+            let _ = repin(content, &app);
+        });
     }
 
     /// Move the host view to the bottom of the content view and the WKWebView
     /// to the top. `addSubview:positioned:relativeTo:` with a nil sibling
-    /// inserts at the very back (`NSWindowBelow`) or very front
-    /// (`NSWindowAbove`) without reparenting.
+    /// inserts at the very back or very front without reparenting.
+    ///
+    /// Deliberately does NOT touch the webview's frame. `apply_layout` already
+    /// re-anchors the host to the DOM-measured rect; z-order only here.
     fn repin(content: *mut AnyObject, app: &tauri::AppHandle) -> bool {
         let host = match macos_surface::host_view(app) {
             Ok(host) => host,
@@ -839,7 +719,7 @@ pub(crate) mod macos_layering {
         unsafe {
             let nil: *mut AnyObject = std::ptr::null_mut();
             let _: () = msg_send![content, addSubview: host, positioned: NS_WINDOW_BELOW, relativeTo: nil];
-            let moved_webview = match super::macos_surface::webview_view(content) {
+            match super::macos_surface::webview_view(content) {
                 Ok(webview) => {
                     let _: () = msg_send![
                         content,
@@ -850,11 +730,7 @@ pub(crate) mod macos_layering {
                     true
                 }
                 Err(_) => false,
-            };
-            // Repinning the host is what matters; treat a missing webview as a
-            // (transient) no-change so the smoke printer stays quiet.
-            let had_host = super::macos_surface::verify_embedded(app);
-            moved_webview || had_host
+            }
         }
     }
 
@@ -865,35 +741,13 @@ pub(crate) mod macos_layering {
         }
         unsafe { CStr::from_ptr(name).to_string_lossy().into_owned() }
     }
-
-    fn subview_list(root: *mut AnyObject) -> String {
-        unsafe {
-            let subviews: *mut AnyObject = msg_send![root, subviews];
-            if subviews.is_null() {
-                return "(none)".into();
-            }
-            let count: usize = msg_send![subviews, count];
-            let mut parts = Vec::with_capacity(count);
-            for i in 0..count {
-                let view: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-                parts.push(class_name(view));
-            }
-            if parts.is_empty() {
-                "(none)".to_string()
-            } else {
-                parts.join(" | ")
-            }
-        }
-    }
 }
 
-/// Windows z-order: mpv's `wid` embedding creates its video window (window
-/// class `mpv`) as a child of the top-level HWND — created after WebView2, so
-/// it lands on TOP of the webview and buries the HTML captions/OSD/controls.
-/// Every sweep finds that child and drops it to the bottom of the sibling
-/// stack (SetWindowPos / HWND_BOTTOM), keeping the DOM chrome above the frames.
-/// `mpv` is mpv's documented video window class and cannot collide with the
-/// WebView2 host, so this is safe even with many sibling child windows.
+/// Windows z-order: libvlc's `set_hwnd` embed creates its video child window
+/// (window class `VLC`) as a child of the top-level HWND — created after
+/// WebView2, so it can land on top of the webview. Every sweep finds that child
+/// and drops it to the bottom of the sibling stack. Best-effort: if VLC hasn't
+/// created its child yet this is a no-op that re-runs on the next sweep.
 #[cfg(target_os = "windows")]
 mod windows_layering {
     use super::{sanitize_surface_layout, window_surface};
@@ -906,10 +760,10 @@ mod windows_layering {
         SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     };
 
-    fn is_mpv_video_window(hwnd: HWND) -> bool {
+    fn is_vlc_video_window(hwnd: HWND) -> bool {
         let mut class = [0u16; 256];
         let len = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
-        len > 0 && String::from_utf16_lossy(&class[..len as usize]) == "mpv"
+        len > 0 && String::from_utf16_lossy(&class[..len as usize]) == "VLC"
     }
 
     unsafe extern "system" fn collect_child(hwnd: HWND, lparam: isize) -> BOOL {
@@ -918,10 +772,7 @@ mod windows_layering {
         1
     }
 
-    /// Drop every child of `parent` whose window class is mpv's video window to
-    /// the bottom of the sibling stack so WebView2's DOM chrome stays on top.
-    /// Returns true if at least one window was re-ordered.
-    fn lower_mpv_video_window(parent: i64) -> bool {
+    fn lower_vlc_video_window(parent: i64) -> bool {
         let parent = parent as isize as HWND;
         let mut children: Vec<HWND> = Vec::new();
         unsafe {
@@ -933,7 +784,7 @@ mod windows_layering {
         }
         let mut moved = false;
         for hwnd in children {
-            if is_mpv_video_window(hwnd) {
+            if is_vlc_video_window(hwnd) {
                 unsafe {
                     SetWindowPos(
                         hwnd,
@@ -953,16 +804,15 @@ mod windows_layering {
 
     pub fn keep_webview_on_top(app: &AppHandle) {
         if let Ok(surface) = window_surface(app) {
-            let _ = lower_mpv_video_window(surface);
+            let _ = lower_vlc_video_window(surface);
         }
     }
 
-    /// Re-size/re-position mpv's embedded child window onto the DOM video stage
-    /// (`mpv_set_layout`). CSS px are scaled to physical px using the window's
+    /// Re-size/re-position VLC's embedded child window onto the DOM video stage
+    /// (`vlc_set_layout`). CSS px are scaled to physical px using the window's
     /// DPI; the y-axis is already top-down on Windows, matching
-    /// `getBoundingClientRect`. Best-effort: if mpv hasn't created its child
-    /// yet this is a no-op that re-runs on the next layout report.
-    pub fn resize_mpv_video_window(parent: i64, rect: SurfaceLayout) -> bool {
+    /// `getBoundingClientRect`.
+    pub fn resize_vlc_video_window(parent: i64, rect: SurfaceLayout) -> bool {
         let rect = sanitize_surface_layout(rect);
         let parent = parent as isize as HWND;
         let scale = unsafe { GetDpiForWindow(parent) } as f64 / 96.0;
@@ -981,7 +831,7 @@ mod windows_layering {
             (rect.height * scale).max(0.0) as i32,
         );
         for hwnd in children {
-            if is_mpv_video_window(hwnd) {
+            if is_vlc_video_window(hwnd) {
                 unsafe {
                     SetWindowPos(
                         hwnd,
@@ -1000,22 +850,18 @@ mod windows_layering {
     }
 }
 
-/// X11 layering (best effort): mpv embeds its video as a NEW child X window of
-/// the same parent as the webkit webview, so it stacks on top. We cache the
-/// webview's XID (the single child observed before mpv attaches) and on every
-/// sweep re-raise it above mpv's child with ConfigureWindow/StackMode::Above.
+/// X11 layering (best effort): libvlc's `set_xwindow` embed creates its video
+/// as a child X window of the same parent as the webview. We cache the
+/// webview's XID (the single child observed before VLC attaches) and on every
+/// sweep re-raise it above VLC's child with ConfigureWindow/StackMode::Above.
 ///
-/// NOTE: relies on XQueryTree reporting children in bottom-to-top stacking
-/// order; on failure every step degrades to a silent no-op. Wayland compositors
-/// own stacking themselves and ignore client-side re-order requests, so there
-/// is deliberately no Wayland back-end — wl_surface z-order would need a
-/// compositor protocol extension (e.g. xdg-toplevel) that is out of scope here.
+/// Wayland compositors own stacking and ignore client-side re-order requests,
+/// so there is deliberately no Wayland back-end.
 #[cfg(all(unix, not(target_os = "macos")))]
 mod x11_layering {
     use super::{sanitize_surface_layout, window_surface};
     use crate::native_player::SurfaceLayout;
     use std::sync::Mutex;
-    use tauri::AppHandle;
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt, StackMode};
     use x11rb::rust_connection::RustConnection;
@@ -1027,10 +873,7 @@ mod x11_layering {
 
     static STATE: Mutex<Option<LayeringState>> = Mutex::new(None);
 
-    /// Best-effort sweep: cache the presumed webview XID from the pre-mpv child
-    /// set, then re-raise it above mpv's stacked-on-top video child. Degrades to
-    /// a silent no-op on any failure (missing connection, no children yet, …).
-    fn rake_webview_above_mpv(parent: i64) -> bool {
+    fn rake_webview_above_vlc(parent: i64) -> bool {
         let parent = parent as u32;
         let mut guard = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = guard.get_or_insert_with(|| LayeringState {
@@ -1054,8 +897,6 @@ mod x11_layering {
             },
             Err(_) => return false,
         };
-        // The first observed (single) child is the webview; a later mpv child
-        // must never win the identity guess.
         if state.webview.is_none() {
             if let Some(&first) = children.first() {
                 state.webview = Some(first);
@@ -1077,16 +918,15 @@ mod x11_layering {
 
     pub fn keep_webview_on_top(app: &AppHandle) {
         if let Ok(surface) = window_surface(app) {
-            let _ = rake_webview_above_mpv(surface);
+            let _ = rake_webview_above_vlc(surface);
         }
     }
 
-    /// Re-size/re-position mpv's embedded child window onto the DOM video stage
-    /// (`mpv_set_layout`). The mpv child is the top-most child (the one that is
+    /// Re-size/re-position VLC's embedded child window onto the DOM video stage
+    /// (`vlc_set_layout`). The VLC child is the top-most child (the one that is
     /// not the cached webview); CSS px are scaled to X pixels from the screen's
-    /// DPI (`pixels_per_inch`). y stays top-down, matching getBoundingClientRect.
-    /// Best-effort, like every X11 arm here; Wayland stays a no-op by design.
-    pub fn resize_mpv_window(parent: i64, rect: SurfaceLayout) -> bool {
+    /// physical geometry. Best-effort, like every X11 arm here.
+    pub fn resize_vlc_window(parent: i64, rect: SurfaceLayout) -> bool {
         let rect = sanitize_surface_layout(rect);
         let parent = parent as u32;
         let mut guard = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1111,7 +951,6 @@ mod x11_layering {
             },
             Err(_) => return false,
         };
-        // The top-most child (that is not the webview) is mpv's video window.
         let mut target = None;
         for &child in children.iter().rev() {
             if state.webview != Some(child) {
@@ -1154,35 +993,28 @@ mod x11_layering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_player::{position_clamped, snapshot_changed};
+    use crate::native_player::{VlcTimeUpdate, position_clamped, snapshot_changed};
 
     #[test]
-    fn zero_surface_is_rejected_before_mpv_init() {
-        // `wid=0` must never reach mpv: instead of embedding inside the app it
-        // would make mpv open its own detached window (the external/PIP
-        // symptom). The guard runs before `with_initializer`.
+    fn zero_surface_is_rejected_before_vlc_init() {
         assert_eq!(
             ensure_embeddable_surface(0).unwrap_err(),
             "native window surface resolved to 0 — nothing to embed into"
         );
-        // Real NSView/HWND/XID ids are non-zero and pass through.
         assert!(ensure_embeddable_surface(0x007fff_abcdef).is_ok());
     }
 
     #[test]
     fn stage_layout_is_sanitized_before_anchoring() {
-        let clean = |r: SurfaceLayout| sanitize_surface_layout(r);
-        // A normal stage rect passes through untouched.
-        let normal = clean(SurfaceLayout {
+        let clean = |r: crate::native_player::SurfaceLayout| sanitize_surface_layout(r);
+        let normal = clean(crate::native_player::SurfaceLayout {
             x: 10.0,
             y: 20.0,
             width: 300.0,
             height: 200.0,
         });
         assert_eq!((normal.x, normal.y, normal.width, normal.height), (10.0, 20.0, 300.0, 200.0));
-        // Negative coordinates / sizes collapse to 0 instead of an ill-formed
-        // frame (which could push mpv's view off-window into a detached spot).
-        let negative = clean(SurfaceLayout {
+        let negative = clean(crate::native_player::SurfaceLayout {
             x: -12.0,
             y: -8.0,
             width: -50.0,
@@ -1192,9 +1024,7 @@ mod tests {
             (negative.x, negative.y, negative.width, negative.height),
             (0.0, 0.0, 0.0, 0.0)
         );
-        // NaN / infinite inputs degrade to a safe zero rect — never panics and
-        // never hands a garbage frame to the window server.
-        let nan = clean(SurfaceLayout {
+        let nan = clean(crate::native_player::SurfaceLayout {
             x: f64::NAN,
             y: 10.0,
             width: f64::INFINITY,
@@ -1205,11 +1035,7 @@ mod tests {
 
     #[test]
     fn read_clock_defaults_before_a_file_is_loaded() {
-        // Can't construct a real mpv here (needs the host lib), so verify the
-        // graceful-default contract through the pure snapshot helper path by
-        // asserting on serialization only when there is no session. The actual
-        // property reads are exercised end-to-end in `tauri dev` with libmpv.
-        let update = MpvTimeUpdate {
+        let update = VlcTimeUpdate {
             position: 0.0,
             duration: 0.0,
             paused: true,
@@ -1222,47 +1048,39 @@ mod tests {
 
     #[test]
     fn position_never_exceeds_the_known_duration() {
-        // Regression: `position.min(duration.max(position))` simplified back to
-        // `position` (dead math), so an EOF tick could echo past the tail.
         assert_eq!(position_clamped(120.0, 100.0), 100.0);
         assert_eq!(position_clamped(50.0, 100.0), 50.0);
         assert_eq!(position_clamped(-4.0, 100.0), 0.0);
-        // Unknown duration: the position passes through as-is.
         assert_eq!(position_clamped(30.0, 0.0), 30.0);
         assert_eq!(position_clamped(-2.0, 0.0), 0.0);
     }
 
     #[test]
     fn ticker_emits_on_change_and_coalesces_noop_beats() {
-        let base = MpvTimeUpdate {
+        let base = VlcTimeUpdate {
             position: 10.0,
             duration: 100.0,
             paused: false,
             ended: false,
         };
-        // First beat after load always crosses the bridge.
         assert!(snapshot_changed(&None, &base));
-        // Jitter within the epsilon with identical flags is coalesced away:
-        // paused playback must not flood the webview event bridge.
-        let same = MpvTimeUpdate {
+        let same = VlcTimeUpdate {
             position: 10.03,
             ..base.clone()
         };
         assert!(!snapshot_changed(&Some(base.clone()), &same));
-        // A real movement (>= the 250 ms spacing at any supported speed) or a
-        // pause/ended transition re-emits so the clock and play state track mpv.
-        let moved = MpvTimeUpdate {
+        let moved = VlcTimeUpdate {
             position: 10.2,
             ..base.clone()
         };
         assert!(snapshot_changed(&Some(base.clone()), &moved));
-        let paused = MpvTimeUpdate {
+        let paused = VlcTimeUpdate {
             position: 10.03,
             paused: true,
             ..base.clone()
         };
         assert!(snapshot_changed(&Some(base.clone()), &paused));
-        let seek_back = MpvTimeUpdate {
+        let seek_back = VlcTimeUpdate {
             position: 5.0,
             ..base.clone()
         };
@@ -1271,9 +1089,6 @@ mod tests {
 
     #[test]
     fn windows_handle_is_readable_on_non_windows() {
-        // The match arms in `window_surface` are type-checked on every target,
-        // so on macOS this confirms the raw-window-handle 0.6 API we depended
-        // on stays stable (the Win32 arm compiles against the real field type).
         #[cfg(windows)]
         {
             let _ = std::mem::size_of::<raw_window_handle::Win32WindowHandle>();

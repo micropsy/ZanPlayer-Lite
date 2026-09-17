@@ -96,7 +96,7 @@ export const SubtitleEditor = ({ onClose }: SubtitleEditorProps) => {
       <div
         className={cn(
           "flex items-center justify-between px-3 py-2.5 border-b shrink-0",
-          theme === "dark" ? "border-gray-700 bg-gray-850" : "border-gray-200 bg-gray-50"
+          theme === "dark" ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"
         )}
       >
         <h3

@@ -25,6 +25,7 @@ vi.mock("@tauri-apps/api/path", () => ({
 }));
 
 import { VideoPlayer } from "./VideoPlayer";
+import { Sidebar } from "./Sidebar";
 import { useAppStore } from "../services/store";
 import type { SubtitleCue } from "../types/subtitle";
 
@@ -509,6 +510,36 @@ describe("VideoPlayer quality-of-life features", () => {
     expect(useAppStore.getState().recentFiles[0].fileName).toBe("movie.mp4");
   });
 
+  it("[hasMedia] placeholders unmount the moment a media path is set, even while engine detection is pending", async () => {
+    useAppStore.setState({
+      currentVideoUrl: null,
+      currentVideoPath: null,
+      recentFiles: [],
+    });
+    // Engine detection HANGS (never resolves) — the frontend must not wait for
+    // it: as soon as a file path lands, the "Select a video" / keyboard
+    // shortcuts / Recent History placeholder container must unmount completely
+    // so no placeholder text can ever sit over an active video.
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "vlc_is_available") return new Promise(() => {});
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    expect(screen.getByText("Select a video or audio file to start")).toBeTruthy();
+
+    act(() => {
+      useAppStore.setState({ currentVideoPath: "/tmp/media.mp4" });
+    });
+
+    // No engine decided yet, no blob resolved — but the placeholders are gone.
+    expect(screen.queryByText("Select a video or audio file to start")).toBeNull();
+    expect(screen.queryByText("Recent History")).toBeNull();
+    expect(screen.queryByText("Keyboard shortcuts:")).toBeNull();
+    // The stage element is already mounted so playback UI can take over.
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+  });
+
   it("playback speed selector applies the rate to the store and the media element", async () => {
     invoke.mockImplementation(async () => undefined);
 
@@ -565,7 +596,7 @@ describe("VideoPlayer quality-of-life features", () => {
   });
 });
 
-describe("VideoPlayer native mpv engine", () => {
+describe("VideoPlayer native VLC engine", () => {
   beforeEach(() => {
     localStorage.clear();
     Object.keys(listeners).forEach((k) => delete listeners[k]);
@@ -597,9 +628,9 @@ describe("VideoPlayer native mpv engine", () => {
     cleanup();
   });
 
-  it("loads the path into libmpv and mirrors its clock into the store when the feature is compiled in", async () => {
+  it("loads the path into libvlc and mirrors its clock into the store when the feature is compiled in", async () => {
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       return undefined;
     });
 
@@ -611,12 +642,12 @@ describe("VideoPlayer native mpv engine", () => {
 
     // ...and the backend receives the load request for the filesystem path.
     await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith("mpv_load", { path: "/tmp/media.wav" })
+      expect(invoke).toHaveBeenCalledWith("vlc_load", { path: "/tmp/media.wav" })
     );
 
     // The first tick mirrors position/duration and the running state.
     await act(async () => {
-      listeners["mpv-timeupdate"]!({
+      listeners["vlc-timeupdate"]!({
         payload: { position: 12.5, duration: 100, paused: false, ended: false },
       });
     });
@@ -625,22 +656,22 @@ describe("VideoPlayer native mpv engine", () => {
 
     // A paused / ended tick stops the UI clock (EOF with keep-open=yes).
     await act(async () => {
-      listeners["mpv-timeupdate"]!({
+      listeners["vlc-timeupdate"]!({
         payload: { position: 99, duration: 100, paused: true, ended: true },
       });
     });
     expect(useAppStore.getState().isPlaying).toBe(false);
 
-    // Space drives libmpv play/pause instead of a media element.
+    // Space drives libvlc play/pause instead of a media element.
     fireEvent.keyDown(window, { code: "Space" });
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_play"));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("vlc_play"));
     fireEvent.keyDown(window, { code: "Space" });
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_pause"));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("vlc_pause"));
   });
 
   it("applies resume, volume, and speed when the native file first reports a duration", async () => {
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       return undefined;
     });
     useAppStore.setState({ resumeAt: 90 });
@@ -649,21 +680,21 @@ describe("VideoPlayer native mpv engine", () => {
     await waitFor(() => expect(screen.getByLabelText("Native video surface")).toBeTruthy());
 
     await act(async () => {
-      listeners["mpv-timeupdate"]!({
+      listeners["vlc-timeupdate"]!({
         payload: { position: 0, duration: 100, paused: false, ended: false },
       });
     });
 
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_set_volume", { level: 100 }));
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_set_speed", { speed: 1 }));
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_seek", { position: 90 }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("vlc_set_volume", { level: 100 }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("vlc_set_speed", { speed: 1 }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("vlc_seek", { position: 90 }));
     expect(useAppStore.getState().resumeAt).toBeNull();
     expect(useAppStore.getState().currentTime).toBe(90);
   });
 
-  it("routes the playback-speed menu to mpv_set_speed in native mode", async () => {
+  it("routes the playback-speed menu to vlc_set_speed in native mode", async () => {
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       return undefined;
     });
 
@@ -672,14 +703,14 @@ describe("VideoPlayer native mpv engine", () => {
 
     fireEvent.click(screen.getByTitle("Playback speed"));
     fireEvent.click(screen.getByText("1.5x"));
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_set_speed", { speed: 1.5 }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("vlc_set_speed", { speed: 1.5 }));
     expect(useAppStore.getState().playbackRate).toBe(1.5);
   });
 
-  it("falls back to the HTML5 blob pipeline when libmpv rejects the load", async () => {
+  it("falls back to the HTML5 blob pipeline when libvlc rejects the load", async () => {
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
-      if (cmd === "mpv_load") throw new Error("libmpv unavailable");
+      if (cmd === "vlc_is_available") return true;
+      if (cmd === "vlc_load") throw new Error("libvlc unavailable");
       return undefined;
     });
 
@@ -691,19 +722,19 @@ describe("VideoPlayer native mpv engine", () => {
   });
 
   it("uses HTML5 when the backend reports the native engine unavailable", async () => {
-    // Nothing to sniff in the frontend: `mpv_is_available` is the single source
+    // Nothing to sniff in the frontend: `vlc_is_available` is the single source
     // of truth for engine selection, so a feature-off desktop build or a mobile
     // build with a failed plugin registration both land here without any UA or
     // platform detection.
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return false;
+      if (cmd === "vlc_is_available") return false;
       return undefined;
     });
 
     render(<VideoPlayer />);
     await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
     expect(screen.queryByLabelText("Native video surface")).toBeNull();
-    expect(invoke).toHaveBeenCalledWith("mpv_is_available");
+    expect(invoke).toHaveBeenCalledWith("vlc_is_available");
   });
 
   it("surfaces a clear message when the HTML5 fallback is handed an MKV it can't demux", async () => {
@@ -712,7 +743,7 @@ describe("VideoPlayer native mpv engine", () => {
     // silent black frame, and never pretend the native engine handles it.
     useAppStore.setState({ currentVideoPath: "/movies/collection.mkv" });
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return false;
+      if (cmd === "vlc_is_available") return false;
       return undefined;
     });
 
@@ -720,6 +751,37 @@ describe("VideoPlayer native mpv engine", () => {
     await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
 
     await waitFor(() => expect(screen.getByText(/MKV container/)).toBeTruthy(), { timeout: 3000 });
+    expect(screen.queryByLabelText("Native video surface")).toBeNull();
+  });
+
+  it("[visibility] the fallback-load error card renders fully opaque, high-contrast, and above the play layer but below the controls bar", async () => {
+    useAppStore.setState({ currentVideoPath: "/movies/broken.mkv" });
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "vlc_is_available") return false;
+      return undefined;
+    });
+
+    render(<VideoPlayer />);
+    await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
+
+    const overlay = await waitFor(() => {
+      const el = document.querySelector("[data-load-error]");
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    // wrapper: centered over the stage, full-stop pointer pass-through, correct
+    // layer slot (z-[25] → above the z-20 play/pause capture, below z-40 chrome)
+    expect(overlay.className).toContain("z-[25]");
+    expect(overlay.className).toContain("pointer-events-none");
+    // card: SOLID zan-black — never the old translucent bg-black/70 ghost that
+    // washed out over bright video
+    const card = overlay.firstElementChild as HTMLElement;
+    expect(card.className).toContain("bg-zan-black");
+    expect(card.className).not.toContain("bg-black/70");
+    // heading + container reason both visible and on-screen
+    expect(screen.getByText("Playback unavailable in this build")).toBeTruthy();
+    expect(screen.getByText(/MKV container/)).toBeTruthy();
+    // stays in the fallback engine, never over the native surface
     expect(screen.queryByLabelText("Native video surface")).toBeNull();
   });
 
@@ -737,23 +799,23 @@ describe("VideoPlayer native mpv engine", () => {
     }
 
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       return undefined;
     });
 
     render(<VideoPlayer />);
     await waitFor(() => expect(screen.getByLabelText("Native video surface")).toBeTruthy());
     expect(document.querySelector("video")).toBeNull();
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("mpv_load", { path: "/tmp/media.wav" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("vlc_load", { path: "/tmp/media.wav" }));
 
     if (navigator.userAgent !== original) {
       Object.defineProperty(navigator, "userAgent", { configurable: true, value: original });
     }
   });
 
-  it("re-anchors the stage rect via mpv_set_layout and falls back to HTML5 when the embed is lost", async () => {
+  it("re-anchors the stage rect via vlc_set_layout and falls back to HTML5 when the embed is lost", async () => {
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       return undefined;
     });
 
@@ -781,7 +843,7 @@ describe("VideoPlayer native mpv engine", () => {
     try {
       // The surface is anchored once the viewport is measured (rect coalesced to px).
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({
             x: expect.any(Number),
             y: expect.any(Number),
@@ -793,7 +855,7 @@ describe("VideoPlayer native mpv engine", () => {
 
       // Backend detects the wid stopped resolving to the host surface.
       await act(async () => {
-        listeners["mpv-embed-lost"]!({ payload: "embedded surface no longer resolves as mpv's wid" });
+        listeners["vlc-embed-lost"]!({ payload: "embedded surface no longer resolves as VLC's wid" });
       });
 
       // The rogue window is never presented as in-app playback: straight to the
@@ -809,7 +871,7 @@ describe("VideoPlayer native mpv engine", () => {
 
   it("re-anchors on window/fullscreen resize so the stage tracks the container", async () => {
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       return undefined;
     });
 
@@ -833,7 +895,7 @@ describe("VideoPlayer native mpv engine", () => {
     viewport.getBoundingClientRect = vi.fn(() => vpRect) as unknown as () => DOMRect;
     try {
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({ width: expect.any(Number) }),
         })
       );
@@ -857,7 +919,7 @@ describe("VideoPlayer native mpv engine", () => {
       fireEvent(document, new Event("fullscreenchange"));
 
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({ x: 10, y: 20, width: 1440, height: 900 }),
         })
       );
@@ -868,7 +930,7 @@ describe("VideoPlayer native mpv engine", () => {
 
   it("re-anchors exactly when sidebar expand/collapse reflows the PlayerViewport", async () => {
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       return undefined;
     });
 
@@ -897,7 +959,7 @@ describe("VideoPlayer native mpv engine", () => {
     try {
       // Sidebar open → surface anchored to the right of the sidebar.
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({ x: 352, width: 848 }),
         })
       );
@@ -909,7 +971,7 @@ describe("VideoPlayer native mpv engine", () => {
       vpRect = { x: 0, y: 40, width: 1200, height: 760, top: 40, left: 0, right: 1200, bottom: 800 };
       fireEvent(window, new Event("resize"));
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({ x: 0, width: 1200 }),
         })
       );
@@ -928,7 +990,7 @@ describe("VideoPlayer native mpv engine", () => {
       };
       fireEvent(window, new Event("resize"));
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({ x: 352, width: 848 }),
         })
       );
@@ -939,7 +1001,7 @@ describe("VideoPlayer native mpv engine", () => {
 
   it("toggles the sidebar 10x (open/close/resize/fullscreen) without a stale anchor", async () => {
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -964,13 +1026,13 @@ describe("VideoPlayer native mpv engine", () => {
     try {
       // First anchor: sidebar CLOSED (x=0).
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({ x: 0, width: 1200 }),
         })
       );
 
       const lastLayout = () => {
-        const calls = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+        const calls = invoke.mock.calls.filter((c) => c[0] === "vlc_set_layout");
         const last = calls[calls.length - 1];
         return (last?.[1] as { rect: { x: number; y: number; width: number; height: number } })?.rect;
       };
@@ -989,7 +1051,7 @@ describe("VideoPlayer native mpv engine", () => {
         });
 
         // Every dispatch during this tick must carry the CURRENT edge, never the previous one.
-        const layouts = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+        const layouts = invoke.mock.calls.filter((c) => c[0] === "vlc_set_layout");
         for (const [, payload] of layouts) {
           const r = (payload as { rect: { x: number; width: number } }).rect;
           expect(r.x).toBe(open ? 352 : 0);
@@ -1021,7 +1083,7 @@ describe("VideoPlayer native mpv engine", () => {
 
   it("anchors the native surface to the PlayerViewport rect verbatim (no sidebar-derived geometry)", async () => {
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1065,13 +1127,13 @@ describe("VideoPlayer native mpv engine", () => {
       );
 
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({ x: 352, y: 40, width: 848, height: 760 }),
         })
       );
 
       // Every dispatch must equal the viewport rect — never the stale stage box.
-      const layouts = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+      const layouts = invoke.mock.calls.filter((c) => c[0] === "vlc_set_layout");
       for (const [, payload] of layouts) {
         const rect = (payload as { rect: { x: number; width: number } }).rect;
         expect(rect.x).toBe(352);
@@ -1084,7 +1146,7 @@ describe("VideoPlayer native mpv engine", () => {
 
   it("sends NO native layout while `[data-player-viewport]` is absent (graceful missing element)", async () => {
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1095,7 +1157,7 @@ describe("VideoPlayer native mpv engine", () => {
     await screen.findByLabelText("Native video surface");
     // Let the reporter's bounded per-frame retry run a moment — still no layout.
     await new Promise((r) => setTimeout(r, 50));
-    const withoutViewport = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+    const withoutViewport = invoke.mock.calls.filter((c) => c[0] === "vlc_set_layout");
     expect(withoutViewport).toHaveLength(0);
 
     // App shell mounts the PlayerViewport (the content column appears) → the
@@ -1118,7 +1180,7 @@ describe("VideoPlayer native mpv engine", () => {
     );
     try {
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({ x: 352, y: 40, width: 848, height: 760 }),
         })
       );
@@ -1153,14 +1215,14 @@ describe("VideoPlayer native mpv engine", () => {
     document.body.appendChild(viewport);
 
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
 
     try {
       render(<VideoPlayer />, { container: viewport });
-      // Native state first: the mpv stage mounts INSIDE the canonical viewport.
+      // Native state first: the VLC stage mounts INSIDE the canonical viewport.
       await waitFor(() =>
         expect(screen.getByLabelText("Native video surface")).toBeTruthy()
       );
@@ -1169,14 +1231,14 @@ describe("VideoPlayer native mpv engine", () => {
 
       // The reporter anchors the surface to the SAME viewport rect.
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({ x: 352, y: 40, width: 848, height: 760 }),
         })
       );
 
       // Every native dispatch to date carries the identical viewport rect — no
       // engine-dependent box was ever substituted.
-      const layouts = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+      const layouts = invoke.mock.calls.filter((c) => c[0] === "vlc_set_layout");
       expect(layouts.length).toBeGreaterThan(0);
       for (const [, payload] of layouts) {
         const rect = (payload as { rect: { x: number; width: number } }).rect;
@@ -1187,7 +1249,7 @@ describe("VideoPlayer native mpv engine", () => {
       // Engine flips back to HTML5 (embed lost): the blob-backed <video> owns
       // the stage, native stage gone — viewport still untouched.
       await act(async () => {
-        listeners["mpv-embed-lost"]!({ payload: "downgrade" });
+        listeners["vlc-embed-lost"]!({ payload: "downgrade" });
       });
       await waitFor(() => expect(document.querySelector("video")).toBeTruthy());
       expect(screen.queryByLabelText("Native video surface")).toBeNull();
@@ -1201,27 +1263,27 @@ describe("VideoPlayer native mpv engine", () => {
   });
 
   it("drops to HTML5 when the native clock never proves the file decoded", async () => {
-    // A file mpv accepts via `loadfile` but cannot actually demux/decode (a
+    // A file VLC accepts via `loadfile` but cannot actually demux/decode (a
     // renamed path, a corrupt container, or an unsupported codec) produces no
-    // `mpv-load` error: `mpv-loaded` fires, then the 250 ms ticker emits a
+    // `VLC-load` error: `vlc-loaded` fires, then the 250 ms ticker emits a
     // single (0,0) snapshot and nothing else. The watchdog must not strand the
     // player on a silent black frame — it falls back to the blob <video>.
     vi.useFakeTimers();
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
 
     render(<VideoPlayer />);
-    // Flush the mount pipeline (availability check → setEngine("mpv") → the
+    // Flush the mount pipeline (availability check → setEngine("VLC") → the
     // watchdog effect that schedules the decode-timeout timer).
     for (let i = 0; i < 4; i++) await act(async () => {});
     expect(screen.getByLabelText("Native video surface")).toBeTruthy();
 
     // Corruption signature: the first (and only) clock snapshot is all zeros.
     await act(async () => {
-      listeners["mpv-timeupdate"]!({
+      listeners["vlc-timeupdate"]!({
         payload: { position: 0, duration: 0, paused: false, ended: false },
       });
     });
@@ -1247,7 +1309,7 @@ describe("VideoPlayer native mpv engine", () => {
     // grace window — the watchdog must neither fire nor touch the native stage.
     vi.useFakeTimers();
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1257,7 +1319,7 @@ describe("VideoPlayer native mpv engine", () => {
     expect(screen.getByLabelText("Native video surface")).toBeTruthy();
 
     await act(async () => {
-      listeners["mpv-timeupdate"]!({
+      listeners["vlc-timeupdate"]!({
         payload: { position: 0.25, duration: 120, paused: false, ended: false },
       });
     });
@@ -1290,7 +1352,7 @@ describe("VideoPlayer native mpv engine", () => {
     document.body.appendChild(viewport);
 
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1306,7 +1368,7 @@ describe("VideoPlayer native mpv engine", () => {
 
       // Flip to HTML5 via embed-lost
       await act(async () => {
-        listeners["mpv-embed-lost"]!({ payload: "downgrade" });
+        listeners["vlc-embed-lost"]!({ payload: "downgrade" });
       });
       await waitFor(() =>
         expect(document.querySelector("video")).toBeTruthy()
@@ -1318,7 +1380,7 @@ describe("VideoPlayer native mpv engine", () => {
     }
   });
 
-  it("[B] Verbatim viewport: rect sent to mpv_set_layout equals getBoundingClientRect exactly", async () => {
+  it("[B] Verbatim viewport: rect sent to vlc_set_layout equals getBoundingClientRect exactly", async () => {
     // §4 / The Absolute Rule: the player consumes the viewport box verbatim;
     // no sidebar width subtracted, no clamping to a sidebar boundary.
     const viewport = document.createElement("div");
@@ -1332,7 +1394,7 @@ describe("VideoPlayer native mpv engine", () => {
     document.body.appendChild(viewport);
 
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1340,12 +1402,12 @@ describe("VideoPlayer native mpv engine", () => {
     try {
       render(<VideoPlayer />, { container: viewport });
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({ x: 352, y: 40, width: 848, height: 760 }),
         })
       );
       // Confirm the four SurfaceLayout fields match exactly — no sidebar subtraction
-      const layoutCall = invoke.mock.calls.find((c) => c[0] === "mpv_set_layout");
+      const layoutCall = invoke.mock.calls.find((c) => c[0] === "vlc_set_layout");
       const sent = (layoutCall![1] as { rect: { x: number; y: number; width: number; height: number } }).rect;
       expect(sent).toEqual({ x: 352, y: 40, width: 848, height: 760 });
     } finally {
@@ -1356,7 +1418,7 @@ describe("VideoPlayer native mpv engine", () => {
   it("[B2] Right-of-sidebar invariant: an inline sidebar forces the native rect to its edge (never under/over)", async () => {
     // §4 / Right-of-sidebar invariant: even if a stale/wrongly-measured
     // viewport rect would start left of the inline sidebar, the rect sent to
-    // mpv_set_layout must start at the sidebar's right edge — the picture never
+    // vlc_set_layout must start at the sidebar's right edge — the picture never
     // bleeds under/over the sidebar. (Verbatim when flex is correct — no-op.)
     const viewport = document.createElement("div");
     viewport.setAttribute("data-player-viewport", "");
@@ -1376,7 +1438,7 @@ describe("VideoPlayer native mpv engine", () => {
     document.body.appendChild(sidebar);
 
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1384,11 +1446,11 @@ describe("VideoPlayer native mpv engine", () => {
     try {
       render(<VideoPlayer />, { container: viewport });
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", {
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", {
           rect: expect.objectContaining({ x: 352, y: 40, width: 848, height: 760 }),
         })
       );
-      const layoutCall = invoke.mock.calls.find((c) => c[0] === "mpv_set_layout");
+      const layoutCall = invoke.mock.calls.find((c) => c[0] === "vlc_set_layout");
       const sent = (layoutCall![1] as { rect: { x: number; y: number; width: number; height: number } }).rect;
       expect(sent).toEqual({ x: 352, y: 40, width: 848, height: 760 });
     } finally {
@@ -1409,7 +1471,7 @@ describe("VideoPlayer native mpv engine", () => {
     document.body.appendChild(viewport);
 
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1417,11 +1479,11 @@ describe("VideoPlayer native mpv engine", () => {
     try {
       render(<VideoPlayer />, { container: viewport });
       await waitFor(() =>
-        expect(invoke).toHaveBeenCalledWith("mpv_set_layout", expect.anything())
+        expect(invoke).toHaveBeenCalledWith("vlc_set_layout", expect.anything())
       );
 
-      // Record how many mpv_set_layout calls exist after the initial anchor
-      const countAfterAnchor = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout").length;
+      // Record how many vlc_set_layout calls exist after the initial anchor
+      const countAfterAnchor = invoke.mock.calls.filter((c) => c[0] === "vlc_set_layout").length;
 
       // Trigger a window resize; the rect is unchanged, so the key short-circuits
       await act(async () => {
@@ -1430,14 +1492,14 @@ describe("VideoPlayer native mpv engine", () => {
       await act(async () => {});
       await act(async () => {});
 
-      const countAfterResize = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout").length;
+      const countAfterResize = invoke.mock.calls.filter((c) => c[0] === "vlc_set_layout").length;
       expect(countAfterResize).toBe(countAfterAnchor);
     } finally {
       viewport.remove();
     }
   });
 
-  it("[D] Degenerate rect (0×0): no mpv_set_layout is sent", async () => {
+  it("[D] Degenerate rect (0×0): no vlc_set_layout is sent", async () => {
     // §9 / §18.4: degenerate rects are skipped so the surface never collapses
     // to a top-left patch while the layout settles.
     const viewport = document.createElement("div");
@@ -1450,7 +1512,7 @@ describe("VideoPlayer native mpv engine", () => {
     document.body.appendChild(viewport);
 
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1464,7 +1526,7 @@ describe("VideoPlayer native mpv engine", () => {
       await act(async () => {});
       await act(async () => {});
 
-      const layoutCalls = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+      const layoutCalls = invoke.mock.calls.filter((c) => c[0] === "vlc_set_layout");
       expect(layoutCalls).toHaveLength(0);
     } finally {
       viewport.remove();
@@ -1475,7 +1537,7 @@ describe("VideoPlayer native mpv engine", () => {
     // §4 / §18.1: when the viewport element is absent, the reporter retries
     // each frame instead of sending a wrong rect.
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1488,7 +1550,7 @@ describe("VideoPlayer native mpv engine", () => {
     await act(async () => {});
     await act(async () => {});
 
-    const layoutCalls = invoke.mock.calls.filter((c) => c[0] === "mpv_set_layout");
+    const layoutCalls = invoke.mock.calls.filter((c) => c[0] === "vlc_set_layout");
     expect(layoutCalls).toHaveLength(0);
   });
 
@@ -1505,7 +1567,7 @@ describe("VideoPlayer native mpv engine", () => {
     document.body.appendChild(viewport);
 
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1519,6 +1581,12 @@ describe("VideoPlayer native mpv engine", () => {
       const controlsBar = viewport.querySelector("[class*='z-40']");
       expect(controlsBar).not.toBeNull();
       expect(controlsBar!.className).toContain("z-40");
+
+      // Strict hardening: the bar is a SELF-CONTAINED stacking context
+      // (`isolate`) so it can never be trapped under a parent stacking/clip
+      // context, and stays anchored inside the viewport container.
+      expect(controlsBar!.className).toContain("isolate");
+      expect(controlsBar!.closest("[data-player-viewport]")).not.toBeNull();
 
       // The play/pause overlay is always in the DOM and carries z-20
       const playPause = viewport.querySelector("[class*='z-20']");
@@ -1546,7 +1614,7 @@ describe("VideoPlayer native mpv engine", () => {
     document.body.appendChild(viewport);
 
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return false;
+      if (cmd === "vlc_is_available") return false;
       return undefined;
     });
 
@@ -1561,7 +1629,7 @@ describe("VideoPlayer native mpv engine", () => {
 
   it("[H] Engine switch preserves the viewport rect exactly (native -> HTML5 -> native)", async () => {
     // §14: switching engines changes the surface, never the region. The rect
-    // fed to mpv_set_layout before and after the switch must be identical.
+    // fed to vlc_set_layout before and after the switch must be identical.
     const viewport = document.createElement("div");
     viewport.setAttribute("data-player-viewport", "");
     const rect = {
@@ -1574,7 +1642,7 @@ describe("VideoPlayer native mpv engine", () => {
 
     let nativeAvailable = true;
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return nativeAvailable;
+      if (cmd === "vlc_is_available") return nativeAvailable;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1585,13 +1653,13 @@ describe("VideoPlayer native mpv engine", () => {
         expect(screen.getByLabelText("Native video surface")).toBeTruthy()
       );
       const rects = () => invoke.mock.calls
-        .filter((c) => c[0] === "mpv_set_layout")
+        .filter((c) => c[0] === "vlc_set_layout")
         .map((c) => (c[1] as { rect: { x: number } }).rect.x);
       expect(rects()).toContain(352);
 
       // Embed-lost → HTML5
       await act(async () => {
-        listeners["mpv-embed-lost"]!({ payload: "downgrade" });
+        listeners["vlc-embed-lost"]!({ payload: "downgrade" });
       });
       await waitFor(() =>
         expect(document.querySelector("video")).toBeTruthy()
@@ -1602,7 +1670,7 @@ describe("VideoPlayer native mpv engine", () => {
     }
   });
 
-  it("[I] mpv-embed-lost always cutover to HTML5 with a blob-backed src", async () => {
+  it("[I] vlc-embed-lost always cutover to HTML5 with a blob-backed src", async () => {
     // §7 / §13 Forbidden #12: a detached or rogue window is never presented
     // as in-app playback; the embed-loss path lands on the blob engine.
     const viewport = document.createElement("div");
@@ -1615,7 +1683,7 @@ describe("VideoPlayer native mpv engine", () => {
     document.body.appendChild(viewport);
 
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1627,7 +1695,7 @@ describe("VideoPlayer native mpv engine", () => {
       );
 
       await act(async () => {
-        listeners["mpv-embed-lost"]!({ payload: "downgrade" });
+        listeners["vlc-embed-lost"]!({ payload: "downgrade" });
       });
       await waitFor(() =>
         expect(document.querySelector("video")).toBeTruthy()
@@ -1641,12 +1709,12 @@ describe("VideoPlayer native mpv engine", () => {
   });
 
   it("[J] Watchdog: a file that never proves decode drops to HTML5 within NATIVE_DECODE_WATCHDOG_MS", async () => {
-    // §7 watchdog: a corrupt or unsupported file fires mpv-loaded but the
+    // §7 watchdog: a corrupt or unsupported file fires vlc-loaded but the
     // clock only returns (0,0) — the watchdog fires after 5 s and the player
     // must fall back to the blob engine (NOT stay silent on a black frame).
     vi.useFakeTimers();
     invoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "mpv_is_available") return true;
+      if (cmd === "vlc_is_available") return true;
       if (cmd === "native_layout_debug") return false;
       return undefined;
     });
@@ -1657,7 +1725,7 @@ describe("VideoPlayer native mpv engine", () => {
 
     // Corrupt signature: position=0, duration=0 — no real decode proof
     await act(async () => {
-      listeners["mpv-timeupdate"]!({
+      listeners["vlc-timeupdate"]!({
         payload: { position: 0, duration: 0, paused: false, ended: false },
       });
     });
@@ -1672,5 +1740,100 @@ describe("VideoPlayer native mpv engine", () => {
     expect(screen.queryByLabelText("Native video surface")).toBeNull();
 
     vi.useRealTimers();
+  });
+
+  it("[K] Click routing: an auto-hidden controls bar never eats a play/pause click (pointer-events disabled while hidden)", async () => {
+    // §20 click-interception regression: the controls bar stays in the DOM and
+    // toggles `opacity-0` when hidden — an INVISIBLE z-40 bar was swallowing
+    // every click over the stage, so pause/resume "failed" intermittently.
+    // Pointer events must be disabled exactly while the bar is hidden
+    // (`pointer-events-none`) and re-enabled when it shows; the base native
+    // stage stays pointer-events-none so the host frame never intercepts ahead
+    // of a DOM control.
+    useAppStore.setState({ isPlaying: true }); // makes onMouseLeave auto-hide
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-player-viewport", "");
+    viewport.getBoundingClientRect = vi.fn(() => ({
+      x: 0, y: 0, width: 1280, height: 720,
+      top: 0, left: 0, right: 1280, bottom: 720,
+    }) as unknown as DOMRect);
+    viewport.className = "relative z-0 min-h-0 min-w-0 flex-1 overflow-clip";
+    document.body.appendChild(viewport);
+
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "vlc_is_available") return true;
+      if (cmd === "native_layout_debug") return false;
+      return undefined;
+    });
+
+    try {
+      render(<VideoPlayer />, { container: viewport });
+      await waitFor(() =>
+        expect(screen.getByLabelText("Native video surface")).toBeTruthy()
+      );
+
+      // The base native stage never intercepts pointer events ahead of DOM chrome
+      const stage = screen.getByLabelText("Native video surface");
+      expect(stage.className).toContain("pointer-events-none");
+
+      // Controls bar starts visible → interactive (pointer-events-auto)
+      const bar = viewport
+        .querySelector("input[type='range']")!
+        .closest("[class*='z-40']") as HTMLElement;
+      expect(bar).not.toBeNull();
+      expect(bar.className).toContain("pointer-events-auto");
+      expect(bar.className).not.toContain("pointer-events-none");
+
+      // Mouse leaves the player while playing → controls auto-hide AND lose
+      // pointer events, so a subsequent click falls through to the play/pause
+      // toggle capture layer (z-20) instead of being swallowed by the bar.
+      const playerRoot = viewport.querySelector("[data-native-stage]")!.parentElement!;
+      fireEvent.mouseLeave(playerRoot);
+      await waitFor(() => expect(bar.className).toContain("pointer-events-none"));
+      expect(bar.className).toContain("opacity-0");
+
+      // Moving the mouse anywhere in the player re-shows the controls →
+      // clickable again. (Bubble the event up from the stage, not the container.)
+      fireEvent.mouseMove(stage);
+      await waitFor(() => expect(bar.className).toContain("pointer-events-auto"));
+      expect(bar.className).not.toContain("pointer-events-none");
+    } finally {
+      viewport.remove();
+    }
+  });
+
+  it("[L] Sidebar is provably opaque (zero transparency bleed) at z-40 inline", async () => {
+    // §2 strict hardening: the opaque sidebar must stay fully opaque so
+    // desktop/wallpaper can never bleed through, in BOTH themes, at explicit
+    // opacity-100, and inline (relative) on desktop so the video is pushed
+    // aside instead of painted under a translucent drawer.
+    for (const theme of ["dark", "light"] as const) {
+      useAppStore.setState({
+        theme,
+        sidebarVisible: true,
+        currentVideo: null,
+        currentVideoUrl: null,
+        currentVideoPath: null,
+        subtitleTracks: [],
+        activeSubtitleTrackId: null,
+      });
+      const { container, unmount } = render(<Sidebar />);
+      const aside = container.querySelector("[data-sidebar]") as HTMLElement;
+      expect(aside).not.toBeNull();
+
+      // Explicit opacity + a fully opaque theme background. Dark theme is now
+      // hardcoded to literal solid black in JSX (and index.css pins
+      // aside[data-sidebar] to #000 !important as a raw backstop), so the
+      // sidebar can never turn transparent — light keeps solid white.
+      expect(aside.className).toContain("opacity-100");
+      expect(aside.className).toContain(theme === "dark" ? "bg-black" : "bg-white");
+
+      // Desktop is ALWAYS inline (relative) — never a floating drawer over the video
+      expect(aside.className).toContain("relative");
+      expect(aside.className).not.toContain("absolute");
+      unmount();
+    }
+    // Restore the default theme/sidebar so later tests see a clean store.
+    useAppStore.setState({ theme: "dark", sidebarVisible: true });
   });
 });

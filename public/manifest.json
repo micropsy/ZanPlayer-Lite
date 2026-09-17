@@ -1,7 +1,7 @@
 {
   "name": "ZanPlayer Lite",
   "short_name": "ZanPlayer",
-  "description": "Local-first video player with on-device AI subtitle generation. Web builds use HTML5 playback and browser codec support; native playback engines exist only in the installed desktop (mpv) and mobile (Media3/AVFoundation) apps.",
+  "description": "Local-first video player with on-device AI subtitle generation. Web builds use HTML5 playback and browser codec support; native playback engines exist only in the installed desktop (libvlc) and mobile (Media3/AVFoundation) apps.",
   "start_url": ".",
   "display": "standalone",
   "display_override": ["standalone", "minimal-ui"],

@@ -1,6 +1,6 @@
 # ZanPlayer Lite
 
-[![Build](https://github.com/micropsy/ZanPlayer-Lite/actions/workflows/build.yml/badge.svg)](https://github.com/micropsy/ZanPlayer-Lite/actions/workflows/build.yml)
+[![Build](https://github.com/micropsy/ZanPlayer-Lite/actions/workflows/test.yml/badge.svg)](https://github.com/micropsy/ZanPlayer-Lite/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/github/license/micropsy/ZanPlayer-Lite.svg)](https://opensource.org/licenses/MIT)
 
 **ZanPlayer Lite** is a modern, beautiful desktop video player with **local, offline, AI-powered subtitle generation** — built with Tauri 2, React 19, TypeScript, and Tailwind CSS v4.
@@ -90,7 +90,7 @@ Releases are **signed**, and the built-in **auto-updater** keeps the app current
 
 The frontend is also a Progressive Web App. A hosted build can be **installed** from Chrome/Edge (Android or desktop) via the in-app *Install app* button or the browser's install affordance, and on iOS/iPadOS via **Add to Home Screen**.
 
-- **Playback is HTML5.** The web build has no native engine — it uses `<video>` and whatever codecs the host browser supports. It never claims (nor attempts) mpv, Media3 or AVFoundation playback.
+- **Playback is HTML5.** The web build has no native engine — it uses `<video>` and whatever codecs the host browser supports. It never claims (nor attempts) VLC, Media3 or AVFoundation playback.
 - **Offline app shell.** A service worker (`public/sw.js`) caches the app shell in production web builds so the installed app opens without a connection; media is streamed, never cached.
 - **No local AI on the web.** Whisper transcription needs the bundled desktop app (native whisper.cpp + bundled FFmpeg sidecar). On the web, transcription and model downloads are hidden by the Tauri-only gates, and all persistent state lives in browser `localStorage` (subject to browser storage limits). Media selected via the browser `<input>` or drag-and-drop stays in memory/`blob:` URLs — the app never requests filesystem permission.
 - Service worker registration is limited to production web builds (`import.meta.env.PROD && !isTauri()`); the Tauri webview never registers.
@@ -118,7 +118,7 @@ npm run tauri dev
 ```bash
 npm run build         # type-check (tsc) + frontend build (vite)
 npm run tauri build   # full desktop bundles (app, dmg, AppImage, deb, msi)
-npm run release -- patch   # semantic-version release pipeline (see RELEASE_PROCESS.md)
+npm run release -- patch   # semantic-version release pipeline (scripts/release.mjs — see AGENTS.md)
 ```
 
 #### Mobile builds (Android / iOS)
@@ -175,7 +175,7 @@ ZanPlayer Lite/
 ├── src-tauri/                  # Backend (Rust/Tauri)
 │   ├── src/main.rs             # Commands: whisper dual-pass jobs, live seek control, ffmpeg, subtitles, model downloads
 │   ├── src/pipeline.rs         # Silero VAD -> chunked Whisper decode (translate on/off) -> PTS sync + seek reset
-│   ├── src/native_player/      # Native playback engines (mpv on desktop, mobile plugin bridge)
+│   ├── src/native_player/      # Native playback engine (LibVLC `vlc-native`, mobile plugin bridge)
 │   ├── mobile/                 # Native mobile plugin sources (Android Media3 / iOS AVPlayer) + READMEs
 │   ├── Cargo.toml / tauri.conf.json
 │   └── capabilities/main.json  # Tauri 2 permissions
@@ -184,36 +184,42 @@ ZanPlayer Lite/
 
 ## Native Playback Backends
 
-Playback is HTML5 `<video>` by default, but ZanPlayer ships dedicated native
-engines behind a single `mpv_*` command surface — the webview never knows which
+Playback is HTML5 `<video>` by default, but ZanPlayer ships a dedicated native
+engine behind a single `vlc_*` command surface — the webview never knows which
 one is underneath:
 
 | Platform | Engine | Gate |
 |---|---|---|
-| macOS | libmpv **Render API** → CAMetalLayer (behind the transparent webview) | `--features native-player,macos-render` |
-| Windows | libmpv `wid` embed (child HWND anchored to the DOM stage) | `--features native-player` |
-| Linux (X11) | libmpv `wid` embed (XID anchored to the DOM stage) | `--features native-player` |
+| macOS | **LibVLC** (`libvlc` from `/Applications/VLC.app`) embedded into a dedicated host NSView **below** the transparent webview | `--features vlc-native` |
+| Windows | LibVLC `set_hwnd` embed (VLC's child HWND pinned to the DOM stage) | `--features vlc-native` |
+| Linux (X11) | LibVLC `set_xwindow` embed (VLC's X window anchored to the DOM stage) | `--features vlc-native` |
 | Android | Media3 **ExoPlayer** (`src-tauri/mobile/android/MediaPlaybackPlugin.kt`) | mobile plugin (in development) |
 | iOS | AVFoundation **AVPlayer** (`src-tauri/mobile/apple/MediaPlaybackPlugin.swift`) | mobile plugin (in development) |
 
-Every backend emits the same 250 ms coalesced `mpv-timeupdate` payload, routes
-seeks through one native funnel, and signals `mpv-embed-lost` to drop back to
-HTML5 when the surface is lost. Shipped desktop builds are feature-off (HTML5);
-see `AGENTS.md` for the engine notes.
+Every backend emits the same 250 ms coalesced `vlc-timeupdate` payload and routes
+seeks through one native funnel. Embed health: desktop emits `vlc-embed-ok` at
+load (the host-NSView attachment probe on macOS; always true on the HWND/X11
+sessions), while `vlc-embed-lost` is emitted **only** by the mobile plugin when
+its position poll keeps failing. Desktop drops back to HTML5 via the 5 s decode
+watchdog or the load-time `vlc-embed-ok` result. Shipped desktop builds are
+feature-off (HTML5); see `AGENTS.md` for the engine notes.
 
 **Codec support is per-backend.** The file picker, drag-and-drop, native
 backends and HTML5 fallback all share one centralized format catalog
 (`src/common/mediaFormats.ts`), but which of those formats actually *decodes*
-depends on the underlying engine (browser codecs, libmpv builds, Media3,
-AVFoundation). The macOS Render-API engine (libmpv) passes its 13-check
-interactive smoke battery with real **MP4/H.264/AAC and MKV/H.264** files
-(render context, Metal frame presentation, decode, clock, transparency,
-plus stage re-anchoring through sidebar reflow, multi-step manual resize, and
-native + web fullscreen). A broader decode corpus was verified against the
-Homebrew libmpv 0.41 build the app links (generated with the bundled FFmpeg
-9.0; every entry decoded, i.e. produced frames without error):
+depends on the underlying engine (browser codecs, the libvlc build, Media3,
+AVFoundation). **The desktop engine is now LibVLC (VLC.app 12.x, ffmpeg-based),
+so the decode matrix below is the previous libmpv-era result and must be
+re-verified against libvlc before it is cited again**. A slim smoke harness
+(`ZANPLAYER_NATIVE_SMOKE` + `ZANPLAYER_NATIVE_SMOKE_VIDEO` with `npm run tauri
+dev -- --features vlc-native`, macOS) drives a real file through the session and
+prints `[native-smoke] RESULT: N/10 passed` — covering session init, decode
+proven by a real clock, host-NSView attach/anchor, an applied rect that is
+non-degenerate, and DOM transparency over the player area — all from stderr
+logs. It has not yet been run against a real file (pending a `.app` bundle built
+with the feature).
 
-| Container/Codec | Native (libmpv) | HTML5 (<video>) |
+| Container/Codec | Native (libmpv-era result — re-verify with libvlc) | HTML5 (<video>) |
 |---|---|---|
 | MP4 / H.264 + AAC | ✅ | ✅ (Safari/Chromium) |
 | MOV / H.265 | ✅ | ✅ (Safari/Chromium) |
@@ -228,7 +234,7 @@ Homebrew libmpv 0.41 build the app links (generated with the bundled FFmpeg
 | WMA | ✅ | ❌ |
 | Corrupt/undecodable file | ⏱️ watchdog → HTML5 fallback | error overlay |
 
-A file mpv accepts via `loadfile` but cannot actually demux/decode (renamed
+A file the native engine accepts but cannot actually demux/decode (renamed
 path, corrupt container, unsupported codec) no longer strands the player on a
 silent black frame: a 5 s decode watchdog (`VideoPlayer.tsx`) cuts back to the
 HTML5 blob engine when the native clock never reports a real duration/playhead,

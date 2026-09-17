@@ -1772,20 +1772,22 @@ fn main() {
         .manage(RenderQueue::default())
         .manage(SeekControl::default())
         .manage(ActiveJob::default())
-        .manage(native_player::MpvControl::default())
+.manage(native_player::VlcControl::default())
         .manage(native_player::MediaPlaybackState::default())
         .plugin(native_player::mobile_media_init())
         .invoke_handler(tauri::generate_handler![
-native_player::mpv_is_available,
-           native_player::mpv_load,
-           native_player::mpv_set_layout,
-            native_player::mpv_play,
-            native_player::mpv_pause,
-            native_player::mpv_seek,
-            native_player::mpv_set_volume,
-            native_player::mpv_set_speed,
-            native_player::mpv_stop,
+            native_player::vlc_is_available,
+            native_player::vlc_load,
+            native_player::vlc_set_layout,
+            native_player::vlc_play,
+            native_player::vlc_pause,
+            native_player::vlc_seek,
+            native_player::vlc_set_volume,
+            native_player::vlc_set_speed,
+            native_player::vlc_stop,
             native_player::native_layout_debug,
+            native_player::set_window_fullscreen,
+            native_player::start_window_drag,
             open_video_dialog,
             open_subtitle_dialog,
             save_subtitle_dialog,
@@ -1810,14 +1812,15 @@ native_player::mpv_is_available,
         .setup(|app| {
             // Env-gated native smoke test: `ZANPLAYER_NATIVE_SMOKE=1
             // ZANPLAYER_NATIVE_SMOKE_VIDEO=<path> npm run tauri dev -- --features
-            // native-player` auto-loads a file through the real mpv session so the
-            // window surface attach + layering re-sort can be verified from logs.
+            // vlc-native` auto-loads a file through the real libvlc session so the
+            // native surface attach + layering re-sort can be verified from logs.
+            let _ = app; // the vlc-native smoke path below clones a handle
             eprintln!("[native-smoke] setup reached");
-            #[cfg(feature = "native-player")]
+            #[cfg(feature = "vlc-native")]
             {
                 if std::env::var("ZANPLAYER_NATIVE_SMOKE").is_ok() {
-                    let handle = app.handle().clone();
                     let video = std::env::var("ZANPLAYER_NATIVE_SMOKE_VIDEO").unwrap_or_default();
+                    let handle = app.handle().clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let _ = native_player::smoke_load(&handle, &video);

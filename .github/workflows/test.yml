@@ -44,7 +44,7 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            libmpv-dev
+            libvlc-dev
 
       - name: Fetch FFmpeg static binaries
         shell: bash
@@ -60,12 +60,14 @@ jobs:
         working-directory: src-tauri
         run: cargo test
 
-      # The `native-player` (libmpv) engine is opt-in and not shipped by the
-      # release builds, but it must keep compiling AND linking on every push
-      # so the feature never silently rots between releases.
-      - name: Verify native-player feature links
+      # The `vlc-native` engine is opt-in and not shipped by the release builds,
+      # but it must keep compiling AND linking on every push so the feature never
+      # silently rots between releases. This is also the only automated cross-check
+      # of the Linux libvlc + X11 FFI arms, which do not compile on the macOS dev
+      # host (build.rs links via the pkg-config `libvlc` probe from libvlc-dev).
+      - name: Verify vlc-native feature links
         working-directory: src-tauri
-        run: cargo build --features native-player
+        run: cargo build --features vlc-native
 
       - name: Run frontend tests
         run: npm run test

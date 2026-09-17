@@ -5,11 +5,22 @@ import { SubtitleEditor } from './components/SubtitleEditor';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Menu, FileVideo, Download } from 'lucide-react';
 import { listen, emit } from '@tauri-apps/api/event';
-import { TauriService, isTauri, isMacOs, isMobileDevice } from './services/tauri';
+import { TauriService, isTauri, isMacOs, isMobileDevice, WINDOW_FULLSCREEN_EVENT } from './services/tauri';
 import { useInstallPrompt } from './hooks/useInstallPrompt';
 import { checkForUpdates } from './services/updater';
 import { UpdateModal } from './components/UpdateModal';
 import { isMediaFile, isVideoFile, isAudioFile, isSubtitleFile, isParsableSubtitleFile } from './common/mediaFormats';
+
+// Title-bar drag region. WKWebView does NOT honor `-webkit-app-region: drag`
+// (that's a Chromium/Electron extension), and Tauri's injected
+// `data-tauri-drag-region` handler calls core `startDragging`, which reads
+// `NSApp.currentEvent` and silently no-ops once the FOCUSED webview consumed
+// the mousedown ("drag works from other apps but dies when the app is active").
+// So there is no attribute magic here: a real mousedown on the strip drives
+// `TauriService.startWindowDrag()` → the backend's synthesized
+// `performWindowDragWithEvent:` — the only path that drags while focused.
+// Interactive children (buttons/inputs) are excluded so clicks keep working
+// while chrome space drags the window.
 
 function App() {
   const theme = useAppStore(state => state.theme);
@@ -162,8 +173,26 @@ function App() {
       setSidebarVisible(!isFullscreen);
     };
     document.addEventListener('fullscreenchange', handleFullscreenChange);
+
+    // Tauri window fullscreen (the product button path) does NOT fire the DOM
+    // `fullscreenchange` event — the document element never goes fullscreen.
+    // The backend emits `zan-fullscreen` right after `set_fullscreen`, so the
+    // chrome (top strip, sidebar) mirrors the same hide-on-fullscreen state
+    // before the macOS Space transition settles.
+    let unlistenWindowFullscreen: (() => void) | null = null;
+    if (isTauri()) {
+      void listen<boolean>(WINDOW_FULLSCREEN_EVENT, (event) => {
+        const isFullscreen = !!event.payload;
+        setIsFullscreenUi(isFullscreen);
+        setSidebarVisible(!isFullscreen);
+      }).then((fn) => {
+        unlistenWindowFullscreen = fn;
+      });
+    }
+
     return () => {
       document.removeEventListener('fullscreenchange', handleFullscreenChange);
+      unlistenWindowFullscreen?.();
     };
   }, [setSidebarVisible]);
 
@@ -214,6 +243,23 @@ function App() {
     if (!isTauri()) {
       setIsDragging(true);
     }
+  }, []);
+
+  /** PROGRAMMATIC top-bar drag (the ONLY drag path — see the header comment on
+   *  why neither `-webkit-app-region` nor `data-tauri-drag-region` can work
+   *  while the app is focused). Only the strip surface triggers it; interactive
+   *  children (hamburger button) and right/middle clicks are excluded so clicks
+   *  keep working while chrome space drags the window. */
+  const handleTopBarMouseDown = useCallback((e: React.MouseEvent<HTMLElement>) => {
+    if (e.button !== 0) {
+      return;
+    }
+    const target = e.target as HTMLElement;
+    if (target.closest('button, a, input, select, textarea, [data-no-drag]')) {
+      return;
+    }
+    e.preventDefault();
+    void TauriService.startWindowDrag();
   }, []);
 
   const onDragLeave = useCallback((e: React.DragEvent) => {
@@ -277,16 +323,16 @@ function App() {
     >
       {/* Solid top bar — replaces the native macOS title bar (window is
           `titleBarStyle: Overlay` + `transparent`, so the traffic lights float
-          over this strip and its `data-tauri-drag-region` keeps the window
-          draggable). Chrome must paint its own opaque background here —
+          over this strip). Chrome must paint its own opaque background here —
           otherwise the transparent window leaks the desktop behind the
           native title bar area. On macOS the strip clears the traffic-light
           group (~76px) so the sidebar toggle icon never crowds the native
-          window controls. Hidden in web fullscreen. */}
+          window controls. Hidden in web fullscreen. The strip + its `flex-1`
+          spacer are the drag surface (`onMouseDown` → `startWindowDrag`). */}
       {isTauri() && !isFullscreenUi && (
         <div
-          data-tauri-drag-region
-          className={`flex h-10 w-full shrink-0 items-center border-b ${
+          onMouseDown={handleTopBarMouseDown}
+          className={`z-40 flex h-10 w-full shrink-0 items-center border-b ${
             isMacOs() ? "pl-[76px]" : "pl-2"
           } pr-2 ${
             theme === 'dark' ? 'bg-zan-black border-white/10' : 'bg-white border-gray-200'
@@ -304,7 +350,7 @@ function App() {
               <Menu className="h-4 w-4" />
             </button>
           )}
-          <div className="flex-1" data-tauri-drag-region />
+          <div className="flex-1" />
         </div>
       )}
 
@@ -332,7 +378,7 @@ function App() {
 
       {/* Content row — sidebar + main stage, below the top bar. The sidebar
           paints its own opaque theme background; the main stage is transparent
-          so the native mpv surface (behind the webview) shows through.
+          so the native VLC surface (behind the webview) shows through.
           `isolate` makes the row an airtight stacking context of its own: the
           sidebar (z-40) and `data-player-viewport` (z-0) are then guaranteed
           siblings whose internal paints can never bleed across each other. */}
@@ -343,7 +389,7 @@ function App() {
             this column's box slides with the sidebar edge in the same commit:
             open -> X/width shrink, closed -> the column fills the row. The
             Player consumes this box VERBATIM for the native surface
-            (`mpv_set_layout`) and renders every overlay (subtitles, controls,
+            (`vlc_set_layout`) and renders every overlay (subtitles, controls,
             OSD) inside it; it never re-derives or clamps against sidebar
             geometry. `overflow-clip` physically prevents the HTML5 fallback
             box and the DOM overlays from painting outside the viewport.

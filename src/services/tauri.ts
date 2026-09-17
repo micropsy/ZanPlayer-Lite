@@ -1,6 +1,7 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { SubtitleCue } from "../types/subtitle";
 
 type BackendCue = {
@@ -50,8 +51,8 @@ export interface InterfaceVideoFile {
   name: string;
 }
 
-/** Live clock snapshot pushed by the native mpv session (250 ms ticker). */
-export interface MpvTimeUpdatePayload {
+/** Live clock snapshot pushed by the native VLC session (250 ms ticker). */
+export interface VlcTimeUpdatePayload {
   position: number;
   duration: number;
   paused: boolean;
@@ -59,7 +60,7 @@ export interface MpvTimeUpdatePayload {
 }
 
 /** Mirrors the Rust `SurfaceLayout` (DOM video-stage rect in CSS px, top-left
- * origin) used to re-anchor the embedded mpv surface onto the React stage. */
+ * origin) used to re-anchor the embedded VLC surface onto the React stage. */
 export interface SurfaceLayout {
   x: number;
   y: number;
@@ -112,6 +113,14 @@ export const isTauri = (): boolean => {
   if (typeof window === "undefined") return false;
   return "__TAURI_INTERNALS__" in window;
 };
+
+/** Backend event mirroring Tauri window fullscreen state. The Rust
+ *  `set_window_fullscreen` command emits this right after calling
+ *  `set_fullscreen`, so the React chrome (top bar, sidebar, fullscreen icon)
+ *  flips before the macOS Space transition settles. Also lets the layout
+ *  reporter re-anchor the native surface on the transition, since the DOM
+ *  `fullscreenchange` event does NOT fire for window-level fullscreen. */
+export const WINDOW_FULLSCREEN_EVENT = "zan-fullscreen";
 
 /** True when running inside the native macOS app window. With
  *  `titleBarStyle: "Overlay"` + `hiddenTitle` the macOS traffic lights
@@ -399,82 +408,82 @@ export class TauriService {
   }
 
   // -------------------------------------------------------------------------
-  // Native player capability. The backend (libmpv on Windows/Linux/macOS, the
+  // Native player capability. The backend (libvlc on Windows/Linux/macOS, the
   // Media3/AVPlayer mobile plugin on Android/iOS) decides availability via
-  // `mpv_is_available`; Web and builds without the native backend return false
+  // `vlc_is_available`; Web and builds without the native backend return false
   // so the UI falls back to <video>. Every call resolves cleanly when native
   // playback is unavailable.
   // -------------------------------------------------------------------------
 
-  /** Whether the current build includes the native mpv playback engine. */
+  /** Whether the current build includes the native VLC playback engine. */
   static async isNativePlayerAvailable(): Promise<boolean> {
     if (!isTauri()) {
       return false;
     }
     try {
-      return (await invoke<boolean>("mpv_is_available")) === true;
+      return (await invoke<boolean>("vlc_is_available")) === true;
     } catch {
       return false;
     }
   }
 
-  static async mpvLoad(path: string): Promise<void> {
+  static async vlcLoad(path: string): Promise<void> {
     if (!isTauri()) {
       return;
     }
-    await invoke<void>("mpv_load", { path });
+    await invoke<void>("vlc_load", { path });
   }
 
-  // Re-anchor the embedded mpv surface onto the DOM video stage. The Rust side
+  // Re-anchor the embedded VLC surface onto the DOM video stage. The Rust side
   // flips the CSS (top-left) rect into native coordinates and frames the host
-  // NSView / resizes the mpv child viewport so playback tracks the container.
-  static async mpvSetLayout(rect: SurfaceLayout): Promise<void> {
+  // NSView / resizes the VLC video viewport so playback tracks the container.
+  static async vlcSetLayout(rect: SurfaceLayout): Promise<void> {
     if (!isTauri()) {
       return;
     }
-    await invoke<void>("mpv_set_layout", { rect });
+    await invoke<void>("vlc_set_layout", { rect });
   }
 
-  static async mpvPlay(): Promise<void> {
+  static async vlcPlay(): Promise<void> {
     if (!isTauri()) {
       return;
     }
-    await invoke<void>("mpv_play");
+    await invoke<void>("vlc_play");
   }
 
-  static async mpvPause(): Promise<void> {
+  static async vlcPause(): Promise<void> {
     if (!isTauri()) {
       return;
     }
-    await invoke<void>("mpv_pause");
+    await invoke<void>("vlc_pause");
   }
 
-  static async mpvSeek(position: number): Promise<void> {
+  static async vlcSeek(position: number): Promise<void> {
     if (!isTauri()) {
       return;
     }
-    await invoke<void>("mpv_seek", { position });
+    await invoke<void>("vlc_seek", { position });
   }
 
-  static async mpvSetVolume(level: number): Promise<void> {
+  static async vlcSetVolume(level: number): Promise<void> {
     if (!isTauri()) {
       return;
     }
-    await invoke<void>("mpv_set_volume", { level });
+    await invoke<void>("vlc_set_volume", { level });
   }
 
-  static async mpvSetSpeed(speed: number): Promise<void> {
+  static async vlcSetSpeed(speed: number): Promise<void> {
     if (!isTauri()) {
       return;
     }
-    await invoke<void>("mpv_set_speed", { speed });
+    await invoke<void>("vlc_set_speed", { speed });
   }
 
-  static async mpvStop(): Promise<void> {
+  static async vlcStop(): Promise<void> {
     if (!isTauri()) {
       return;
     }
-    await invoke<void>("mpv_stop");
+    await invoke<void>("vlc_stop");
   }
 
   /** Whether `ZANPLAYER_NATIVE_LAYOUT_DEBUG=1` was active at process start:
@@ -491,6 +500,47 @@ export class TauriService {
       return (await invoke<boolean>("native_layout_debug")) === true;
     } catch {
       return false;
+    }
+  }
+
+  /** PRODUCT fullscreen path: Tauri WINDOW fullscreen, never the HTML Fullscreen
+   *  API. `document.documentElement.requestFullscreen()` reparents the WKWebView
+   *  into a separate macOS fullscreen window, leaving the native host NSView
+   *  stranded in the old window — the stage goes permanently black.
+   *  Window-level `set_fullscreen` resizes the SAME window into the fullscreen
+   *  Space, so webview, host view and the native surface move together and the
+   *  layout reporter re-anchors on the resize. */
+  static async setWindowFullscreen(fullscreen: boolean): Promise<void> {
+    if (!isTauri()) {
+      return;
+    }
+    await invoke<void>("set_window_fullscreen", { fullscreen });
+  }
+
+  /** Title-bar chrome drag. On macOS this drives the backend's synthesized
+   *  `performWindowDragWithEvent:` command (`start_window_drag`) — the ONLY
+   *  path that works while the app is focused/active, because tao's core
+   *  `startDragging` reads `NSApp.currentEvent`, which the focused WKWebView
+   *  has already consumed by the time the JS mousedown round-trips to Rust.
+   *  Other platforms use the core `startDragging` (works there).
+   *  Must be called inside the user gesture (mousedown) — never async-deferred. */
+  static async startWindowDrag(): Promise<void> {
+    if (!isTauri()) {
+      return;
+    }
+    if (isMacOs()) {
+      try {
+        await invoke<void>("start_window_drag");
+        return;
+      } catch {
+        // Command unavailable (older backend) — fall through to the core path.
+      }
+    }
+    try {
+      await getCurrentWindow().startDragging();
+    } catch {
+      // A drag is already in progress or we are in a plain browser tab:
+      // safe to ignore.
     }
   }
 }

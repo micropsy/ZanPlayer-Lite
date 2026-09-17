@@ -1,8 +1,8 @@
 # iOS native playback backend (AVFoundation AVPlayer)
 
 In-app Tauri v2 mobile plugin that gives ZanPlayer Lite a dedicated native video
-player on iOS / iPadOS, wired behind the exact same `mpv_*` command surface as
-the desktop libmpv engines. The Rust side (`src-tauri/src/native_player`) treats
+player on iOS / iPadOS, wired behind the exact same `vlc_*` command surface as
+the desktop LibVLC engine. The Rust side (`src-tauri/src/native_player`) treats
 it as just another `NativeSession`; the webview never knows the engine changed.
 
 ## What it is
@@ -31,7 +31,7 @@ it as just another `NativeSession`; the webview never knows the engine changed.
 | `diagnostics` | — | `[diagnostics: "..."]` |
 
 Argument keys are snake_case and the `position` response is camelCase —
-exactly what `mobile.rs` serializes/deserializes (`MpvTimeUpdate`).
+exactly what `mobile.rs` serializes/deserializes (`VlcTimeUpdate`).
 
 ## Integrating into the app
 
@@ -80,8 +80,7 @@ all supported iOS devices. WebM/VP9/AV1 are not supported by AVFoundation.
 
 - The Rust bridge (`mobile.rs`, `mobile_ios.rs`, `MediaPlaybackState`,
   shared coalescing helpers) compiles and is covered by unit tests on this
-  host (`cargo test`, `cargo clippy`, `cargo build --features
-  native-player,macos-render`).
+  host (`cargo test`, `cargo clippy`, `cargo build --features vlc-native`).
 - **This Swift file has never been compiled or run.** There is no Xcode
   installation (`xcodebuild` → "unable to find Xcode.app"), no iOS SDK,
   no Swift compiler for the iOS target on this machine. It is written

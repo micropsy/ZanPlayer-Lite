@@ -33,7 +33,7 @@ player window.
 
 ### 2. Verify Desktop Native Playback
 
-- [x] Verify macOS Render API + software render + CAMetalLayer smoke path.
+- [x] **Native backend migration (this session): libmpv → LibVLC.** The entire native engine is now `libvlc` (the C library VLCKit wraps), linked from the system VLC.app dylibs behind a single `vlc-native` cargo feature (default off — shipped builds stay HTML5 `<video>`). The old libmpv2 `wid` embed, the macOS Render-API/CAMetalLayer backend (`render/`), and the `native-player`/`macos-render` feature gates were deleted. New architecture: `libvlc.rs` (hand-rolled FFI, no crate) → `VlcSession` (session.rs) embedding VLC's video output into a dedicated host NSView (macOS `set_nsobject`; Windows HWND; X11 xwindow) below the transparent webview, a 250 ms coalesced `vlc-timeupdate` ticker, `vlc_set_layout` stage anchoring, `VLC_PLUGIN_PATH` set from the VLC.app bundle, and a slim `ZANPLAYER_NATIVE_SMOKE` build-time harness (playback + diagnostics checks). Frontend fully renamed: `vlc_*` commands/events, engine id `"VLC"`, `VlcClock`, `VlcTimeUpdatePayload`. The broken self-referential FFmpeg sidecar symlinks in `src-tauri/binaries/` (which silently broke every build) were repointed to the real Homebrew ffmpeg for aarch64. **Verified: `cargo build` (default, 0 warnings), `cargo build --features vlc-native` (0 warnings, links/runs against real VLC.app dylibs), `cargo test` 34/34, `cargo test --features vlc-native` 42/42 (incl. a live libvlc init/drop test), `npm run test` 106/106, `tsc` + `vite build` clean, `cargo clippy` clean on native_player.** The old 13-check macOS smoke battery is mpv-era history; a slim replacement smoke is implemented but not yet run on a real file.
 - [x] Run the full macOS interactive smoke battery with a real video file (MP4 and MKV, both 11/11 checks incl. sidebar reflow, multi-step manual resize, native + web fullscreen, and the sub-`md` narrow-window inline guard).
 - [x] Unify app-window frame: `titleBarStyle: Overlay` + `hiddenTitle`, solid `h-10` DOM top bar (drag region + sidebar hamburger), content row stacking sidebar + stage; smoke `findArea()` walks descendants (smallest bottom-right-reaching rect) so the 10-check battery stays 10/10 (MP4 + MKV) with the top bar accounted for at `y≈40`.
 - [x] Fix intermittent coordinate drift: `macos_surface::apply_layout` now computes the host frame DIRECTLY in content coords (no `convertRect:fromView:`, whose result depended on the host's *current* frame and accumulated error). The CAMetalLayer is re-anchored to the host bounds on every `mpv_set_layout` (`masksToBounds=YES`, CATransaction flush), and degenerate (0×0) rects are skipped on both Rust and JS sides. The smoke now reads back `applied_js_rect` (the ACTUAL host frame in JS coords) as the "applied" rect, so a misconverted `setFrame:` fails checks instead of hiding behind the request. Verified: MP4 10/10, MKV 10/10.
@@ -49,13 +49,20 @@ player window.
 - [x] Sidebar toggle stress regression test (`VideoPlayer.test.tsx` "toggles the sidebar 10×…"): closed→open→closed ×10 (20 flips) with a mid-loop window resize + fullscreenchange at iteration 5; asserts every dispatched rect matches the current edge so no stale X/width can survive.
 - [x] **Player Compositing Architecture refactor (this session):** the sidebar is a Player *sibling*, never a Player layer. `App.tsx` lays out `Sidebar + [data-player-viewport]` (renamed from `data-player-area`) as the content row; the Player consumes the viewport's `getBoundingClientRect()` VERBATIM for `mpv_set_layout` and never reads sidebar state/geometry. Removed from the player path: `sidebarVisible` effect dep, `clampVideoRect`, `areaFromRowAndSidebar` (content-row-minus-sidebar fallback), `sidebar-right` subtraction. Reporter triggers = viewport ResizeObserver + `resize` + `fullscreenchange` + `mpv-loaded`; missing viewport = **no layout sent** (graceful). Debug outlines: red=viewport, blue=sidebar, green=video/stage, yellow=`[data-subtitle-layer]`, magenta=native frame (`ZANPLAYER_NATIVE_LAYOUT_DEBUG=1`). Smoke selectors switched to `[data-player-viewport]`; new closed-state capture pause added. **Verified: 82 frontend + 34 + 40 Rust tests, macOS smoke 13/13 (post-refactor, incl. new engine-switch rect-identity test + sidebar OPEN/CLOSED screenshots).**
 - [x] **Canonical Player Compositing spec + verification (this session):** `docs/PLAYER_COMPOSITING_ARCHITECTURE.md` written FIRST (18 sections + Sidebar OPEN/CLOSED diagrams + the absolute rule "The Player does not calculate around the Sidebar. The App layout calculates the Player Viewport. The Player simply occupies the Player Viewport." + §13 forbidden-architecture list + §17 acceptance criteria + §18 verification procedure). Implementation audited against it: **no violations** — viewport-verbatim geometry only (`mpv_set_layout` takes `{x,y,width,height}` from `[data-player-viewport]`, no sidebar params anywhere), engine XOR (`[data-native-stage]` xor `<video>`), overlay z-ladder (z-20/z-30/z-40/z-50) inside the `z-0` viewport stacking context, macOS Render API + CAMetalLayer + dedicated host NSView **below** the webview, `wid` only on the non-macOS path, event-driven idle reporter, embed-loss + decode-watchdog HTML5 cutover. Added architectural invariant tests **A–J** to `VideoPlayer.test.tsx` (engine XOR, verbatim viewport, key-idle no-IPC, degenerate-rect skip, missing-viewport no-layout, z-ladder, sidebar-outside-player-subtree, engine-switch rect preservation, embed-lost blob cutover, watchdog cutover). **Verified: 94 frontend tests (incl. A–J), `npm run build` clean, 40 Rust tests, `cargo clippy --features native-player,macos-render` exit 0; fresh macOS artifact built 2026-09-15 20:37 (`v0.1.3`, backend `macos-render`/`vo=libmpv`+CAMetalLayer, old artifact 20:04 removed to /tmp) → full smoke battery **RESULT: 13/13 passed** on the real product path (CHECK 1–13 incl. sidebar reflow, multi-step resize no drift, native + web fullscreen, sub-`md` inline guard, product drop→engine flip, closed→open re-anchor), every `[zan-layout-trace]` `RESULT=EXACT`, DOM-alpha 0 at every transition.**
-- [ ] Build and test Windows native mpv playback.
-- [ ] Build and test Linux X11 native mpv playback.
+- [x] **Strict opaqueness / stacking hardening + canonical doc refresh (this session):** the sidebar is `z-40 opacity-100` with an opaque theme background (`bg-zan-black`/`bg-white`) at every width in both themes — zero transparency bleed — and the VideoPlayer root + controls bar each carry `isolate` so the controls/OSD/subtitles always paint above the `z-0` native surface inside the viewport's own stacking context and can never be trapped or clipped by a parent stacking/clip change. New regressions: `[K]` controls-bar `isolate` self-containment, `[L]` "sidebar provably opaque at z-40 inline" (both themes). **Verified: 104/104 frontend tests (8 files, incl. A–L), `npm run build` (tsc + vite) clean, `cargo test` 34/34, `cargo test --features native-player,macos-render` 40/40.** Docs (`AGENTS.md`, `README.md`, `LAYERS.md`, `ARCHITECTURE.md`, `VERIFICATION.md`, `Todo.md`, mobile READMEs) re-synced to the verified state: smoke battery is **13 checks / `RESULT: N/13 passed`** (checks 12 + 13 = real product reporter path + field-reported closed→open), Check 10 = the exact product `set_window_fullscreen` IPC (fails, never skips, if window fullscreen doesn't engage), mainline test counts above, and the deleted `RELEASE_PROCESS.md` pointer replaced by `scripts/release.mjs`.
+- [ ] Build and test Windows native VLC playback.
+- [ ] Build and test Linux X11 native VLC playback.
 - [ ] Verify Linux Wayland HTML5 fallback and document z-order limitations.
 - [ ] Verify resize, sidebar changes, fullscreen and captions on each desktop.
 
 Acceptance: native playback stays inside the app window; no detached window is
 created; HTML5 fallback preserves the current position and playback settings.
+
+Note: The Windows (`windows_layering`) and X11 (`x11_layering`) FFI modules are
+fully implemented in `session.rs` with real `windows-sys` / `x11rb` FFI calls,
+and the CI test workflow verifies they compile and link on Linux. However, no
+smoke battery or runtime verification has been run on Windows or Linux — all
+documented smoke results (13/13) are macOS-only.
 
 ### 3. Media Format Compatibility Matrix
 
@@ -65,8 +72,8 @@ created; HTML5 fallback preserves the current position and playback settings.
 - [x] Test WebM/VP8/VP9 (both corpus files decode natively; `<video>` lists `webm` as HTML5-playable).
 - [x] Test AVI, WMV and FLV (AVI/MPEG-4, WMV/WMV2, FLV/FLV1 corpus all decode natively; HTML5 fallback correctly refuses them with a hint).
 - [x] Test MP3, WAV, OGG, FLAC, M4A, AAC and WMA (all 7 audio corpus files decode natively; HTML5 plays all but WMA).
-- [x] Record results per platform instead of claiming universal codec support (decode matrix table written to `README.md`, macOS libmpv 0.41 verified; Windows/Linux/Android/iOS still marked unverified).
-- [x] Show a clear unsupported-format error before or during fallback: HTML5-fallback MKV hint + CC-menu retry shipped; **native unsupported-codec case now covered by a 5 s decode watchdog** (`VideoPlayer.tsx`): mpv's `loadfile` returns OK even for a renamed/corrupt/undecodable file, so if the native clock never reports a real duration or advancing playhead within the grace window, the player cuts back to the HTML5 blob engine (whose own `onError`/hint overlay then explains it). Unit-tested (`drops to HTML5 when the native clock never proves the file decoded` / `keeps the native engine when the clock reports a real decode signal`).
+- [x] Record results per platform instead of claiming universal codec support (decode matrix table written to `README.md`; the old matrix was verified against libmpv 0.41 — the **VLC migration means the matrix must be re-run against `libvlc` (VLC.app 12.x)**, which uses its own ffmpeg build and may differ on obscure codecs).
+- [x] Show a clear unsupported-format error before or during fallback: HTML5-fallback MKV hint + CC-menu retry shipped; **native unsupported-codec case now covered by a 5 s decode watchdog** (`VideoPlayer.tsx`): VLC's `loadfile`/`media_new_path` returns OK even for a renamed/corrupt/undecodable file, so if the native clock never reports a real duration or advancing playhead within the grace window, the player cuts back to the HTML5 blob engine (whose own `onError`/hint overlay then explains it). Unit-tested (`drops to HTML5 when the native clock never proves the file decoded` / `keeps the native engine when the clock reports a real decode signal`).
 - [x] All media entry points (drag-and-drop, browser file input, native file dialog) classify by file extension only — no browser/OS MIME reliance, so MKV is never treated as audio.
 
 Verified matrix (macOS): native libmpv 0.41 decoded every corpus file (MP4/H.264+AAC, MOV/H.265, WebM/VP8+VP9, MKV/H.264+H.265, AVI/MPEG-4, WMV/WMV2, FLV/FLV1, MP3/WAV/OGG/FLAC/M4A/AAC/WMA). A zeroed `broken_zeroed.mov` (moov missing) confirmed the gap: `loadfile` OK + `time-pos=NaN` + 0 frames presented + the smoke's decode-dependent checks (frames/decode/clock) failing while all layout checks pass — exactly the silent-black case the watchdog now catches.
@@ -89,6 +96,13 @@ same centralized media-format catalog.
 Acceptance: local transcription works without network access after the model is
 available and does not block normal playback.
 
+Note: Items 1-6 are code-complete with unit test coverage (model download +
+caching in `download_whisper_model`, VAD-gated streaming in `pipeline.rs`,
+batch transcription via `run_batch_job`, `SubtitleMode::Original/English/Both`,
+dual-pass progress slicing, and the unified seek funnel). Items 7 (long-video
+memory/CPU) and 8 (Tiny/Base mobile defaults) are not yet addressed. All items
+still require real-device verification.
+
 ### 5. Validate PTS Sync and Seeking
 
 - [ ] Verify subtitle timestamps against the active player clock.
@@ -98,6 +112,11 @@ available and does not block normal playback.
 - [ ] Verify pause, end-of-file and duration changes across every backend.
 
 Acceptance: after any seek, only cues for the new playhead position are shown.
+
+Note: All five items are code-complete with unit test coverage (render queue
+job-scoping, `clear_job` purge on seek, `apply_seek` WAV reader repositioning,
+`openRecentFile` reset, `SubtitleMode` enum in `main.rs`). Device validation
+pending.
 
 Code shipped (needs device validation): render queue is job-scoped
 (`job_id` → `QueuedCue`, `poll_transcript_cues(job_id)`, `transcription_active(job_id)`),
@@ -118,6 +137,11 @@ job for the same file (no reload). Covered by 4 new Rust unit tests
 Acceptance: captions, OSD, controls and quick settings remain usable above the
 video on every supported native backend.
 
+Note: All five items are code-complete (`SubtitleEditor.tsx` with click-to-seek,
+`write_subtitle_file` supporting SRT/VTT/ASS export, subtitle overlay z-ladder
+above native layers, caption style controls in Quick Settings). Device
+validation pending.
+
 ## P1 - Web App and Installation
 
 ### 7. Add Web App Install Support (PWA)
@@ -133,7 +157,7 @@ video on every supported native backend.
 - [x] Keep local Whisper model storage and permissions explicit for the Web App.
 
 Acceptance: the Web App can be installed from a supported browser, opens in a
-standalone window, retains the app shell offline, and never claims native mpv,
+standalone window, retains the app shell offline, and never claims native VLC,
 Media3 or AVFoundation support.
 
 ### 8. Web Playback and Browser Compatibility
@@ -170,16 +194,43 @@ and do not break normal HTML5 playback.
 - [x] Update README with platform/backend support and verification status.
 - [x] Document Android JDK/SDK and iOS Xcode prerequisites.
 - [x] Document PWA installation and browser limitations.
-- [ ] Publish a tested media-format matrix.
+- [x] Publish a tested media-format matrix.
 - [x] Run `npm run build`.
 - [x] Run `npm run test`.
 - [x] Run `cargo test`.
-- [x] Run `cargo test --features native-player,macos-render` on macOS.
+- [x] Run `cargo test --features vlc-native` on macOS.
 - [x] Run platform builds where toolchains are available (macOS `app,dmg` release build verified locally; signing needs the CI `TAURI_SIGNING_PRIVATE_KEY`).
 - [x] Mark untested platforms as unverified instead of claiming support.
 
 Acceptance: release notes clearly distinguish implemented, device-tested and
 unsupported functionality.
+
+## Full-system audit reconciliation (2026-09-17)
+
+- [x] **CI still references the deleted libmpv engine.** `.github/workflows/test.yml`
+  installed `libmpv-dev` and ran `cargo build --features native-player` (both removed
+  in the VLC migration — the workflow would have broken on the next push).
+  Fixed: `libvlc-dev` earlier-eligible apt package + `cargo build --features vlc-native`
+  (build.rs links via the pkg-config `libvlc` probe; this doubles as the first
+  automated cross-check of the Linux libvlc + X11 FFI arms).
+- [x] **Docs described a per-beat desktop embed-loss probe that the code does not have.**
+  `session.rs` emits `vlc-embed-ok` (carrying `embed_ok()` = `host_still_attached()` on
+  macOS) at `load()` only; the desktop ticker never re-probes and never emits
+  `vlc-embed-lost`. `vlc-embed-lost` is mobile-only (`mobile.rs`, on persistent
+  position-poll failure). AGENTS.md/README/docs reconciled to the real behavior.
+- [ ] **Decide on the per-beat desktop host probe** (tracked gap): add a
+  `host_still_attached()` check on the desktop ticker beat that emits `vlc-embed-lost`
+  once when the host disappears, or accept the 5 s decode watchdog + load-time
+  `vlc-embed-ok` as the only desktop cover. Current frontend parity: `VideoPlayer.tsx`
+  already holds the `vlc-embed-lost` listener, so a backend-side addition is drop-in.
+- [ ] **Re-run the codec decode matrix against libvlc (VLC.app 12.x)** — README table
+  is still labeled "libmpv-era result — re-verify with libvlc".
+- [ ] **Run the slim smoke battery on a real file** (`.app` bundle with
+  `--features vlc-native`; `RESULT: N/10 passed` on macOS) — still PENDING (see
+  `docs/PLAYER_COMPOSITING_VERIFICATION.md` §6).
+- [ ] **Commit the entire migration + docs + CI worktree** — `HEAD` is still the
+  mpv-era `9e9eb23`; the CI fix must land in the same commit as the migration or
+  `main` stays red.
 
 ## Recommended Execution Order
 

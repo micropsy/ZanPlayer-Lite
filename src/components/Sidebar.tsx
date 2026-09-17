@@ -365,9 +365,9 @@ export const Sidebar = () => {
     <aside
       data-sidebar
       className={cn(
-        `flex h-full w-[min(22rem,calc(100vw-1rem))] max-w-full shrink-0 flex-col border-r z-40 ${positionCls}`,
+        `flex h-full w-[min(22rem,calc(100vw-1rem))] max-w-full shrink-0 flex-col border-r z-40 opacity-100 ${positionCls}`,
         theme === "dark" 
-          ? "border-white/10 bg-zan-black" 
+          ? "border-white/10 bg-black" 
           : "border-gray-200 bg-white"
       )}
       onDragOver={onDragOver}
@@ -419,7 +419,7 @@ export const Sidebar = () => {
                 ? "bg-zan-blue/25 text-white ring-1 ring-inset ring-zan-cyan/60"
                 : "bg-gray-100 text-gray-900 ring-1 ring-inset ring-zan-cyan"
               : theme === "dark"
-                ? "text-gray-500 hover:text-gray-300"
+                ? "text-gray-300 hover:text-white"
                 : "text-gray-500 hover:text-gray-700"
           )}
         >
@@ -432,7 +432,7 @@ export const Sidebar = () => {
           className={cn(
             "flex h-10 w-10 items-center justify-center rounded-lg transition-colors",
             theme === "dark"
-              ? "text-gray-400 hover:bg-zan-blue/15 hover:text-white"
+              ? "text-zinc-200 hover:bg-zan-blue/15 hover:text-white"
               : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"
           )}
         >
@@ -469,7 +469,7 @@ export const Sidebar = () => {
               <label className={cn(
                 "flex items-center justify-center gap-2 px-4 py-2 text-sm cursor-pointer",
                 theme === "dark"
-                  ? "text-gray-400 hover:text-white"
+                  ? "text-zinc-200 hover:text-white"
                   : "text-gray-500 hover:text-gray-700"
               )}>
                 or upload a file
@@ -567,7 +567,7 @@ export const Sidebar = () => {
                             "font-semibold",
                             theme === "dark" ? "text-white" : "text-gray-900"
                           )}>Export SRT</p>
-                          <p className="text-xs text-gray-400">SubRip format</p>
+                          <p className="text-xs text-zinc-300">SubRip format</p>
                         </div>
                       </button>
                       <button
@@ -585,7 +585,7 @@ export const Sidebar = () => {
                             "font-semibold",
                             theme === "dark" ? "text-white" : "text-gray-900"
                           )}>Export VTT</p>
-                          <p className="text-xs text-gray-400">WebVTT format</p>
+                          <p className="text-xs text-zinc-300">WebVTT format</p>
                         </div>
                       </button>
                     </div>
@@ -600,12 +600,12 @@ export const Sidebar = () => {
             <div className={cn(
               "p-4 border-b",
               theme === "dark"
-                ? "border-gray-700 bg-gray-850"
+                ? "border-gray-700 bg-gray-800"
                 : "border-gray-200 bg-gray-50"
             )}>
               <h3 className={cn(
                 "text-xs font-semibold uppercase tracking-wider flex items-center gap-2",
-                theme === "dark" ? "text-gray-400" : "text-gray-500"
+                theme === "dark" ? "text-zinc-300" : "text-gray-500"
               )}>
                 <List className="w-4 h-4" />
                 Subtitle Tracks
@@ -625,7 +625,7 @@ export const Sidebar = () => {
                     activeSubtitleTrackId === track.id
                       ? "bg-blue-900/20 border-blue-500 shadow-lg shadow-blue-900/10"
                       : theme === "dark"
-                        ? "bg-gray-800 border-gray-700 hover:bg-gray-750 hover:border-gray-600"
+                        ? "bg-gray-800 border-gray-700 hover:bg-gray-700 hover:border-gray-600"
                         : "bg-white border-gray-200 hover:bg-gray-50 hover:border-gray-300"
                   )}
                 >
@@ -643,7 +643,7 @@ export const Sidebar = () => {
                       </h4>
                       <p className={cn(
                         "text-xs mt-0.5",
-                        theme === "dark" ? "text-gray-500" : "text-gray-400"
+                        theme === "dark" ? "text-zinc-300" : "text-gray-400"
                       )}>{track.cues.length} cues</p>
                     </div>
                     <div className="flex items-center gap-1">
@@ -668,7 +668,7 @@ export const Sidebar = () => {
                   )}>
                     <label className={cn(
                       "text-xs mb-1 block",
-                      theme === "dark" ? "text-gray-500" : "text-gray-500"
+                      theme === "dark" ? "text-zinc-300" : "text-gray-500"
                     )}>Shift all (seconds)</label>
                     <div className="flex gap-2">
                       <input
@@ -696,7 +696,7 @@ export const Sidebar = () => {
               {subtitleTracks.length === 0 && (
                 <div className={cn(
                   "flex flex-col items-center justify-center py-12",
-                  theme === "dark" ? "text-gray-500" : "text-gray-400"
+                  theme === "dark" ? "text-zinc-300" : "text-gray-400"
                 )}>
                   <div className={cn(
                     "w-12 h-12 rounded-full flex items-center justify-center mb-3",

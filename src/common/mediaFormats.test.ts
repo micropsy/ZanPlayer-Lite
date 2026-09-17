@@ -101,4 +101,21 @@ describe("media formats catalog", () => {
     expect(html5UnsupportedHint("song.mp3")).toBeNull();
     expect(html5UnsupportedHint("notes.txt")).toBeNull();
   });
+
+  it("tailors the hint to native-engine availability: convert prompt without native, neither-engine note with it", () => {
+    const noNative = html5UnsupportedHint("movie.mkv", false);
+    expect(noNative).toContain("MKV container");
+    expect(noNative).toContain("fallback player");
+    // the feature-off shipped build must steer to a native-enabled build
+    expect(noNative).toContain("native engine enabled");
+
+    const withNative = html5UnsupportedHint("movie.mkv", true);
+    expect(withNative).toContain("MKV container");
+    expect(withNative).toContain("neither engine");
+
+    // availability never widens playability: MP4 stays hint-free either way
+    expect(html5UnsupportedHint("clip.mp4", true)).toBeNull();
+    expect(html5UnsupportedHint("song.mp3", false)).toBeNull();
+    expect(html5UnsupportedHint("notes.txt", true)).toBeNull();
+  });
 });

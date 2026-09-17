@@ -1,6 +1,6 @@
 @import "tailwindcss";
 
-/* The Tauri window is transparent so the native mpv surface (embedded behind
+/* The Tauri window is transparent so the native VLC surface (embedded behind
    the webview) is visible through the player stage. Every opaque surface in
    the app paints its own background in DOM; only the video stage leans on the
    transparency. Keep the root background clean for that contract. */
@@ -19,6 +19,56 @@
     .pwa-safe-top {
       top: calc(max(1rem, env(safe-area-inset-top)));
     }
+  }
+
+  /* SIDEBAR OPAQUE CONTRACT — absolute raw override. The Tauri window is
+     transparent (the native VLC video view lives behind the webview), so
+     ANY alpha inside `aside[data-sidebar]` bleeds the desktop wallpaper
+     through. This pins a literal non-transparent hex with !important so no
+     inherited/injected/transition/utility style can ever make the sidebar
+     transparent, across every open/close/drawer toggle state. The light
+     theme keeps a solid hex too (never an alpha value). */
+  aside[data-sidebar] {
+    background-color: #000000 !important;
+    opacity: 1 !important;
+  }
+  html.light aside[data-sidebar] {
+    background-color: #ffffff !important;
+  }
+
+  /* TEXT COLOR FLOOR — zero-specificity (:where) defaults so sidebar and
+     controls content can NEVER fall back to the UA's black on black. Any
+     element that forgot its own text-* class inherits a bright, high-contrast
+     color instead of becoming an invisible black glyph; explicit text-*
+     classes (0,1,0) always win over these floors. */
+  :where(aside[data-sidebar]) {
+    color: #e5e7eb; /* zinc-200 */
+  }
+  :where(html.light aside[data-sidebar]) {
+    color: #1f2937; /* gray-800 */
+  }
+  :where([data-controls-bar]) {
+    color: #f8fafc; /* slate-50 */
+  }
+
+  /* CONTROLS BAR OPAQUE CONTRACT — raw !important fallback on the controls
+     wrapper itself. The bar in VideoPlayer.tsx is painted with a flat solid
+     background; this rule is a backstop so no Tailwind purge/utility
+     resolution or injected stylesheet can degrade it to a translucent ghost. */
+  [data-controls-bar] {
+    background-color: #000000 !important;
+  }
+
+  /* FALLBACK-LOAD ERROR OVERLAY VISIBILITY FLOOR — the "this container can't
+     be decoded" card must render fully readable over the black stage in BOTH
+     engines: solid opaque card (zan-black) + bright body copy, raw !important
+     so no utility resolution or injected style can dim it into a ghost (same
+     contract as [data-controls-bar]). */
+  [data-load-error] {
+    color: #f8fafc !important; /* slate-50 body copy */
+  }
+  [data-load-error] > div {
+    background-color: #0a0d14 !important; /* zan-black, fully opaque */
   }
 }
 

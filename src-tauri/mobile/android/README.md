@@ -1,8 +1,8 @@
 # Android native playback backend (Media3 ExoPlayer)
 
 In-app Tauri v2 mobile plugin that gives ZanPlayer Lite its dedicated native
-video player on Android, wired behind the exact same `mpv_*` command surface as
-the desktop libmpv engines. The Rust side (`src-tauri/src/native_player`) treats
+video player on Android, wired behind the exact same `vlc_*` command surface as
+the desktop LibVLC engine. The Rust side (`src-tauri/src/native_player`) treats
 it as just another `NativeSession`; the webview never knows the engine changed.
 
 ## What it is
@@ -31,7 +31,7 @@ it as just another `NativeSession`; the webview never knows the engine changed.
 | `diagnostics` | — | `{ diagnostics: "..." }` |
 
 Argument keys are snake_case and the `position` response is camelCase —
-exactly what `mobile.rs` serializes/deserializes (`MpvTimeUpdate`).
+exactly what `mobile.rs` serializes/deserializes (`VlcTimeUpdate`).
 
 ## Integrating into the app
 
@@ -77,7 +77,7 @@ opened files). The plugin resolves it as:
 - The Rust bridge (`mobile.rs`, `mobile_android.rs`, `mobile_ios.rs`,
   `MediaPlaybackState`, shared coalescing helpers) compiles and is covered by
   unit tests on this host (`cargo test`, `cargo clippy`, `cargo build --features
-  native-player,macos-render`).
+  vlc-native`).
 - **This Kotlin file has never been compiled or run.** There is no JDK, no
   Android SDK, no Rust `aarch64-linux-android` target on the development machine
   (verified: `java` and `xcodebuild` both absent). It is written against the

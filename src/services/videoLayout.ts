@@ -1,7 +1,7 @@
 /**
  * PlayerViewport layout contract.
  *
- * The native surface (macOS/Windows/X11 `mpv_set_layout`, mobile no-op) and the
+ * The native surface (macOS/Windows/X11 `vlc_set_layout`, mobile no-op) and the
  * HTML5 fallback share ONE rule: they render inside the PlayerViewport — the
  * `[data-player-viewport]` column the App shell lays out next to the sidebar.
  * The Player consumes that box VERBATIM: it never measures the sidebar, never

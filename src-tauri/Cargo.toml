@@ -9,14 +9,15 @@ edition = "2021"
 
 [build-dependencies]
 tauri-build = { version = "2.6.2", features = [] }
-# Feature build only: libmpv-sys emits `-lmpv` with no search path, which
-# misses Homebrew/Apple-Silicon dylibs. pkg-config surfaces that path here.
+# Optional feature build only: locate the system libvlc (VLCKit's engine) for
+# the `vlc-native` backend. On macOS we default to the dylibs bundled in
+# /Applications/VLC.app; on Linux a `libvlc` pkg-config .pc probe is used.
 pkg-config = "0.3"
 
 [dependencies]
 # `macos-private-api` is a no-op off macOS but must be enabled so tauri-build
 # accepts the `app.macOSPrivateApi: true` config used for the transparent
-# webview stage under the native mpv player.
+# webview stage under the VLC video surface.
 tauri = { version = "2.11.2", features = ["protocol-asset", "macos-private-api"] }
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
@@ -34,48 +35,39 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 directories-next = "2.0"
 regex = "1.10"
 hound = "3.5"
-# Native playback via libmpv (feature `native-player`). Optional so the app
-# still builds on machines without libmpv; when enabled, mpv renders into the
-# native window surface behind the transparent webview stage.
-# `libmpv2` targets the 2.x client API (mpv >= 0.35 / current Homebrew exposes
-# 2.5), unlike the older `libmpv` crate which pinned 1.108 and got rejected at
-# runtime by modern mpv ("VersionMismatch").
-libmpv2 = { version = "6", optional = true }
+# Raw window handles for the libvlc embed targets (X11 xwindow id, etc.).
 raw-window-handle = { version = "0.6", optional = true }
+# Native playback via the LibVLC C API (`libvlc` — the engine VLCKit wraps).
+# Optional so the app still builds on machines without libvlc; when enabled,
+# VLC renders into the native window surface behind the transparent webview
+# stage. Uses the system libvlc (macOS: the dylibs bundled in /Applications/
+# VLC.app; Linux: the distro `libvlc`; Windows: the `libvlc` DLL next to the
+# binary). The previous mpv backend (libmpv2 / Render API / CAMetalLayer) has
+# been removed entirely.
+# (No `vlc` crate dependency: the FFI is declared locally in libvlc.rs.)
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-# Enables the in-window mpv player module (src-tauri/src/native_player).
-native-player = ["dep:libmpv2", "dep:raw-window-handle"]
-# macOS-native playback via the libmpv Render API (software backend rendered
-# into a Metal texture presented through a CAMetalLayer). Implies native-player.
-# The window-VO `wid` embed is deliberately NOT used on macOS (it can still
-# detach a top-level window); this Render-API backend is what un-gates macOS in
-# `native_supported()` and only compiles behind this explicit flag.
-macos-render = [
-    "native-player",
-    "dep:libmpv2-sys",
-]
+# Enables the in-window VLC player module (src-tauri/src/native_player).
+# Replaces the old `native-player`/`macos-render` (mpv) gates with one
+# backend. Shipped builds stay feature-off (HTML5 `<video>` is the default).
+vlc-native = ["dep:raw-window-handle"]
 
-# macOS-only z-order enforcement: mpv's `wid` attachment adds its video view
-# above the webview, which would bury HTML captions/OSD under the video. We
-# re-sort the window's subviews so the transparent WKWebView sits on top.
-# `libmpv2-sys` is the Render-API backend (macos-render): the SW render-context
-# FFI. The Metal/CAMetalLayer surface is driven through plain `objc2` raw
-# message dispatch (no framework crate), declared locally in macos_render.rs.
+# The macOS obsolescence of MPV is complete; the only macOS-specific ObjC we
+# still link is the title-bar drag synthesis (macos_window.rs) and the
+# dedicated host NSView that libvlc draws into (macos_surface in session.rs),
+# both driven through plain `objc2` raw message dispatch.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-libmpv2-sys = { version = "4", optional = true }
 
-# Windows z-order + geometry: mpv's video HWND (window class "mpv") is dropped
-# to the bottom of the child stack with SetWindowPos so WebView2's DOM chrome
-# stays above the decoded frames, and re-sized onto the DOM stage (GetDpiForWindow).
+# Windows embed: libvlc draws into a child HWND we create under the top-level
+# window; the DOM chrome stays above it via WebView2 (SetWindowPos re-order).
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi"] }
 
-# X11 z-order: raise the webview X window (x11rb, pure Rust, no libX11 link
-# dependency) above mpv's child window. Best-effort only — Wayland compositors
-# own the stacking and ignore client-side re-order attempts.
+# X11 embed: libvlc draws into a child X window we create; x11rb re-raises the
+# webview above it. Best-effort only — Wayland compositors own stacking and
+# ignore client-side re-order attempts.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11rb = { version = "0.13", features = ["allow-unsafe-code"] }

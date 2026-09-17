@@ -1,25 +1,25 @@
-//! Mobile native playback backends behind the same `MpvControl`/commands as the
-//! desktop libmpv sessions. Only compiled on Android and iOS.
+//! Mobile native playback backends behind the same `VlcControl`/commands as the
+//! desktop libvlc sessions. Only compiled on Android and iOS.
 //!
-//! There is no libmpv here: playback is owned by the platform player — Media3
+//! There is no libvlc here: playback is owned by the platform player — Media3
 //! ExoPlayer on Android, AVFoundation AVPlayer on iOS — reached through an
 //! in-app Tauri mobile plugin (`zanplayer-media`) registered from `main.rs`
 //! (`mobile_android.rs` / `mobile_ios.rs`). Rust drives it with synchronous
 //! `run_mobile_plugin` commands, and a 250 ms ticker polls the `position`
-//! command to feed the exact same coalesced `mpv-timeupdate` payload the
-//! desktop tickers emit — the webview never knows or cares which engine is
-//! underneath (`mpv_*` commands, `mpv-loaded`, `mpv-timeupdate`,
-//! `mpv-embed-lost` all behave identically).
+//! command to feed the exact same coalesced `vlc-timeupdate` payload the
+//! desktop ticker emits — the webview never knows or cares which engine is
+//! underneath (`vlc_*` commands, `vlc-loaded`, `vlc-timeupdate`,
+//! `vlc-embed-lost` all behave identically to the old mpv names).
 //!
 //! The native video surface is inserted BEHIND the transparent webview on
 //! first `load` (full-stage; the webview chrome floats above), so
 //! `apply_surface_layout` is a deliberate no-op here — the DOM stage maps to
-//! the whole window on mobile. There is no `wid` embed dance, so `mpv-embed-lost`
+//! the whole window on mobile. There is no embed dance, so `vlc-embed-lost`
 //! only fires if the position poll persistently fails (a dead/native player),
 //! which routes the frontend to the same HTML5-blob fallback as desktop.
 
 use crate::native_player::{
-    position_clamped, snapshot_changed, MediaPlaybackState, MpvTimeUpdate, SurfaceLayout,
+    position_clamped, snapshot_changed, MediaPlaybackState, VlcTimeUpdate, SurfaceLayout,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +61,7 @@ struct SpeedPayload {
     speed: f64,
 }
 
-/// Mobile native playback session behind the unified `mpv_*` command surface.
+/// Mobile native playback session behind the unified `vlc_*` command surface.
 pub struct MobileSession {
     handle: tauri::plugin::PluginHandle<tauri::Wry>,
     ticking: Arc<AtomicBool>,
@@ -107,12 +107,12 @@ impl MobileSession {
                 // or paused/ended/duration changed. Mirror the native snapshot
                 // through the shared clamp so a stale poll can never echo a
                 // position past the clip tail.
-                let mut last_snapshot: Option<MpvTimeUpdate> = None;
+                let mut last_snapshot: Option<VlcTimeUpdate> = None;
                 while ticking.load(Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(250));
                     let snapshot =
-                        match handle.run_mobile_plugin::<MpvTimeUpdate>(CMD_POSITION, ()) {
-                            Ok(s) => MpvTimeUpdate {
+                        match handle.run_mobile_plugin::<VlcTimeUpdate>(CMD_POSITION, ()) {
+                            Ok(s) => VlcTimeUpdate {
                                 position: position_clamped(s.position, s.duration),
                                 ..s
                             },
@@ -121,7 +121,7 @@ impl MobileSession {
                                 // is gone. Reuse desktop's embed-loss recovery:
                                 // emit once, stop the clock, webview drops to HTML5.
                                 let _ = app.emit(
-                                    "mpv-embed-lost",
+                                    "vlc-embed-lost",
                                     format!("mobile position poll failed: {e}"),
                                 );
                                 break;
@@ -129,13 +129,13 @@ impl MobileSession {
                         };
                     if snapshot_changed(&last_snapshot, &snapshot) {
                         last_snapshot = Some(snapshot.clone());
-                        let _ = app.emit("mpv-timeupdate", snapshot);
+                        let _ = app.emit("vlc-timeupdate", snapshot);
                     }
                 }
             });
         }
 
-        let _ = app.emit("mpv-loaded", ());
+        let _ = app.emit("vlc-loaded", ());
         Ok(())
     }
 
@@ -195,7 +195,7 @@ impl MobileSession {
 
 /// Mobile native surfaces fill the whole window behind the transparent webview,
 /// so there is nothing to anchor onto the DOM stage — the service stays a no-op
-/// to keep the `mpv_set_layout` contract uniform across every backend.
+/// to keep the `vlc_set_layout` contract uniform across every backend.
 pub(crate) fn apply_surface_layout(_app: &AppHandle, _rect: &SurfaceLayout) -> Result<(), String> {
     Ok(())
 }

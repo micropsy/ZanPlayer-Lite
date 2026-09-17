@@ -30,7 +30,8 @@ import {
 import {
   TauriService,
   isTauri,
-  type MpvTimeUpdatePayload,
+  WINDOW_FULLSCREEN_EVENT,
+  type VlcTimeUpdatePayload,
   type TranscriptionBatchDonePayload,
   type TranscriptionDonePayload,
   type TranscriptionErrorPayload,
@@ -78,8 +79,8 @@ const TRANSLATION_TRACK_NAME = "Auto-Generated (English)";
 // Standard media-player playback speeds, cycled/selected from the control bar.
 const SPEED_RATES = [0.5, 1, 1.25, 1.5, 2] as const;
 
-// Grace window for the native decode watchdog. A file mpv cannot demux/decode
-// still triggers `mpv-loaded` and returns OK from `loadfile`, but its 250 ms
+// Grace window for the native decode watchdog. A file VLC cannot demux/decode
+// still triggers `vlc-loaded` and returns OK from `loadfile`, but its 250 ms
 // ticker never reports a real duration or advancing playhead — after this long
 // the player cuts to the HTML5 fallback instead of stranding on a black frame.
 const NATIVE_DECODE_WATCHDOG_MS = 5000;
@@ -92,17 +93,21 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const [isMuted, setIsMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [videoSource, setVideoSource] = useState<string | null>(null);
-  // Playback engine. `mpv` uses the native libmpv surface embedded behind the
+  // Playback engine. `VLC` uses the native libvlc surface embedded behind the
   // transparent webview stage; `html5` falls back to the <video> element; null
   // while engine detection is in flight.
-  const [engine, setEngine] = useState<"html5" | "mpv" | null>(null);
-  // Mirror of the native clock (driven by `mpv-timeupdate` events).
-  const [mpvClock, setMpvClock] = useState({ position: 0, duration: 0 });
+  const [engine, setEngine] = useState<"html5" | "VLC" | null>(null);
+  // Whether the current session could reach the native engine. Drives the
+  // fallback-container hint wording: with native, an HTML5 failure means both
+  // engines failed; without it, the user must convert or use a native build.
+  const [nativeAvailable, setNativeAvailable] = useState(false);
+  // Mirror of the native clock (driven by `vlc-timeupdate` events).
+  const [vlcClock, setVlcClock] = useState({ position: 0, duration: 0 });
   const nativeLoadedRef = useRef(false);
   const resumeAppliedRef = useRef(false);
-  const engineRef = useRef<"html5" | "mpv" | null>(null);
+  const engineRef = useRef<"html5" | "VLC" | null>(null);
   engineRef.current = engine;
-  // Set once mpv's clock reports a real duration or playhead for the current
+  // Set once VLC's clock reports a real duration or playhead for the current
   // file — the signal that the file actually demuxed/decoded. The decode
   // watchdog re-reads this instead of subscribing to a second ticker listener.
   const nativeDecodeProvenRef = useRef(false);
@@ -154,6 +159,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     theme,
     resumeAt,
     setResumeAt,
+    sidebarVisible,
   } = useAppStore();
 
   // Latest playback prefs, readable from inside async native event handlers
@@ -198,15 +204,33 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const trackForId = (id: string | null) =>
     subtitleTracks.find((t) => t.id === id) ?? null;
 
-  // The active clock and duration come from the native mpv mirror when the
-  // engine is mpv (there is no <video> element to read), otherwise fall back
+  // The active clock and duration come from the native VLC mirror when the
+  // engine is VLC (there is no <video> element to read), otherwise fall back
   // to the media element.
-  const isNative = engine === "mpv";
+  const isNative = engine === "VLC";
+  // A media selection is active — a filesystem path (native or blob), a
+  // browser URL, a resolved blob, an engine that is already VLC, OR (the hard
+  // belt-and-suspenders guard) a live native session that has actually decoded
+  // content: VLC only emits a positive clock once real frames exist, so even a
+  // backend-direct load that never touched the store (native harness, future
+  // "open with") unmounts the placeholders the instant playback begins. This is
+  // the SINGLE gate for the empty-state placeholder container ("Select a
+  // video", keyboard shortcuts, Recent History): the moment ANY media is
+  // targeted it unmounts — including during engine detection and native load —
+  // so the placeholders can never flash over, or overlap, an active video once
+  // playback begins. The stage element itself still decides native-vs-HTML5.
+  const hasMedia =
+    engine === "VLC" ||
+    !!currentVideoPath ||
+    !!currentVideoUrl ||
+    !!videoSource ||
+    vlcClock.position > 0 ||
+    vlcClock.duration > 0;
   const currentClock = isNative
-    ? mpvClock.position
+    ? vlcClock.position
     : (videoRef.current?.currentTime ?? 0);
   const durationClock = isNative
-    ? mpvClock.duration
+    ? vlcClock.duration
     : (videoRef.current?.duration ?? 0);
 
   // Dual-subtitle mode uses both generated tracks; single mode uses the active track.
@@ -221,9 +245,9 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const togglePlay = () => {
     if (isNative) {
       if (isPlaying) {
-        void TauriService.mpvPause().catch(() => setIsPlaying(true));
+        void TauriService.vlcPause().catch(() => setIsPlaying(true));
       } else {
-        void TauriService.mpvPlay().catch(() => setIsPlaying(false));
+        void TauriService.vlcPlay().catch(() => setIsPlaying(false));
       }
       setIsPlaying(!isPlaying);
       return;
@@ -259,7 +283,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     touchRecentFile(s.currentVideoPath, s.currentTime);
   }, [touchRecentFile]);
 
-  // Keep the persisted-playhead helper reachable from the mpv event handlers.
+  // Keep the persisted-playhead helper reachable from the VLC event handlers.
   recordPlaybackRef.current = maybeRecordPlayback;
 
   const clearPendingSeek = () => {
@@ -295,13 +319,13 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
   const notifyPipelineSeekRef = useRef<(target: number) => void>(() => {});
   notifyPipelineSeekRef.current = notifyPipelineSeek;
 
-  // Single funnel for every native (mpv) seek. Ordering is the contract:
+  // Single funnel for every native (VLC) seek. Ordering is the contract:
   //   1. clear any pending HTML5 seek guard,
   //   2. move the optimistic store clock,
   //   3. notify the streaming pipeline FIRST so its passes drop VAD state and
-  //      reposition the WAV reader *before* mpv moves (no pre-seek cue race),
-  //   4. then issue the mpv seek. The coalesced backend tick reconciles the
-  //      exact position, so the UI clock never drifts from mpv's PTS.
+  //      reposition the WAV reader *before* VLC moves (no pre-seek cue race),
+  //   4. then issue the VLC seek. The coalesced backend tick reconciles the
+  //      exact position, so the UI clock never drifts from VLC's PTS.
   const seekNative = (target: number) => {
     clearPendingSeek();
     const clamped = Math.max(
@@ -310,7 +334,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     );
     setCurrentTime(clamped);
     notifyPipelineSeekRef.current(clamped);
-    void TauriService.mpvSeek(clamped).catch(() => {});
+    void TauriService.vlcSeek(clamped).catch(() => {});
   };
   const seekNativeRef = useRef<(target: number) => void>(() => {});
   seekNativeRef.current = seekNative;
@@ -332,7 +356,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     if (isNative) {
       const newMuted = !isMuted;
       setIsMuted(newMuted);
-      void TauriService.mpvSetVolume(newMuted ? 0 : volume * 100).catch(() => {});
+      void TauriService.vlcSetVolume(newMuted ? 0 : volume * 100).catch(() => {});
       return;
     }
     if (videoRef.current) {
@@ -347,7 +371,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     setVolume(newVolume);
     if (isNative) {
       setIsMuted(newVolume === 0);
-      void TauriService.mpvSetVolume(newVolume * 100).catch(() => {});
+      void TauriService.vlcSetVolume(newVolume * 100).catch(() => {});
       return;
     }
     if (videoRef.current) {
@@ -403,6 +427,20 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
 
   const toggleFullscreen = async () => {
     try {
+      if (isTauri()) {
+        // PRODUCT fullscreen path = Tauri WINDOW fullscreen, never the HTML
+        // Fullscreen API. `document.documentElement.requestFullscreen()`
+        // reparents the WKWebView into a separate macOS fullscreen window,
+        // leaving the native host NSView (VLC's VOUT) behind in the old
+        // window — the stage renders permanently black. Window-level
+        // `set_fullscreen` instead resizes the SAME window (webview and host
+        // view stay together) into the fullscreen Space, so the layout
+        // reporter just re-anchors on the resize. The backend emits
+        // `zan-fullscreen` so the chrome (top bar, sidebar, fullscreen icon)
+        // flips before the Space transition settles.
+        await TauriService.setWindowFullscreen(!isFullscreen);
+        return;
+      }
       if (!document.fullscreenElement) {
         await document.documentElement.requestFullscreen();
         setIsFullscreen(true);
@@ -434,7 +472,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
             const newVolume = Math.min(1, volume + 0.1);
             setVolume(newVolume);
             if (newVolume > 0) setIsMuted(false);
-            void TauriService.mpvSetVolume(newVolume * 100).catch(() => {});
+            void TauriService.vlcSetVolume(newVolume * 100).catch(() => {});
           } else if (videoRef.current) {
             const newVolume = Math.min(1, videoRef.current.volume + 0.1);
             videoRef.current.volume = newVolume;
@@ -447,7 +485,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
             const newVolume = Math.max(0, volume - 0.1);
             setVolume(newVolume);
             if (newVolume === 0) setIsMuted(true);
-            void TauriService.mpvSetVolume(newVolume * 100).catch(() => {});
+            void TauriService.vlcSetVolume(newVolume * 100).catch(() => {});
           } else if (videoRef.current) {
             const newVolume = Math.max(0, videoRef.current.volume - 0.1);
             videoRef.current.volume = newVolume;
@@ -474,8 +512,24 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
       setIsFullscreen(!!document.fullscreenElement);
     };
 
+    let unlistenWindowFullscreen: (() => void) | null = null;
+    if (isTauri()) {
+      // The Tauri window-fullscreen path (the product button) does NOT fire the
+      // DOM `fullscreenchange` event — the backend emits `zan-fullscreen`
+      // instead. Mirror it so the icon/keyboard ("F") and control state stay in
+      // sync.
+      void listen<boolean>(WINDOW_FULLSCREEN_EVENT, (event) => {
+        setIsFullscreen(!!event.payload);
+      }).then((fn) => {
+        unlistenWindowFullscreen = fn;
+      });
+    }
+
     document.addEventListener("fullscreenchange", handleFullscreenChange);
-    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      unlistenWindowFullscreen?.();
+    };
   }, []);
 
   // Close CC menu, speed menu, and quick-settings popover when clicking outside
@@ -507,7 +561,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     setSeekTo(null);
     if (isNative) {
       // Native engine: funnel the seek through seekNative so the pipeline
-      // flushes first and `mpv-timeupdate` reconciles from the backend tick.
+      // flushes first and `vlc-timeupdate` reconciles from the backend tick.
       seekNativeRef.current(target);
       return;
     }
@@ -561,7 +615,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
     setResumeAt(null);
     if (isNative) {
       // Park the target; it is applied on the first native clock tick once the
-      // file is loaded (or by the `mpv-loaded` handler if that wins the race).
+      // file is loaded (or by the `vlc-loaded` handler if that wins the race).
       pendingResumeRef.current = target;
       if (nativeLoadedRef.current) {
         seekNativeRef.current(target);
@@ -588,7 +642,7 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
 
   // Apply playback speed to any freshly loaded video and re-apply when the
   // user picks a new rate while a video is already running. Native playback
-  // is driven by `mpv_set_speed` instead (see `applyPlaybackRate`).
+  // is driven by `vlc_set_speed` instead (see `applyPlaybackRate`).
   useEffect(() => {
     if (isNative) return;
     if (!videoSource || !videoRef.current) return;
@@ -747,8 +801,8 @@ export const VideoPlayer = ({ onEditSubtitles }: { onEditSubtitles?: () => void 
       if (!realtimeStartedRef.current) {
         realtimeStartedRef.current = true;
         if (!s.isPlaying) {
-          if (engineRef.current === "mpv") {
-            void TauriService.mpvPlay().catch(() => setIsPlaying(false));
+          if (engineRef.current === "VLC") {
+            void TauriService.vlcPlay().catch(() => setIsPlaying(false));
           } else {
             videoRef.current?.play().catch(() => setIsPlaying(false));
           }
@@ -892,8 +946,8 @@ useEffect(() => {
             if (!realtimeStartedRef.current) {
               realtimeStartedRef.current = true;
               if (!s.isPlaying) {
-                if (engineRef.current === "mpv") {
-                  void TauriService.mpvPlay().catch(() => setIsPlaying(false));
+                if (engineRef.current === "VLC") {
+                  void TauriService.vlcPlay().catch(() => setIsPlaying(false));
                 } else {
                   videoRef.current?.play().catch(() => setIsPlaying(false));
                 }
@@ -939,11 +993,11 @@ useEffect(() => {
     };
   }, [setTranscriptionProgress, setIsTranscribing, flushQueuedCues]);
 
-  // Native mpv engine: mirror its playback clock into the store (there is no
+  // Native VLC engine: mirror its playback clock into the store (there is no
   // <video> element firing `timeupdate`), and apply resume / volume / speed on
-  // the first observed tick so it never races the backend's `mpv-loaded` event.
+  // the first observed tick so it never races the backend's `vlc-loaded` event.
   useEffect(() => {
-    if (!isTauri() || engine !== "mpv") return;
+    if (!isTauri() || engine !== "VLC") return;
     let disposed = false;
     let unlistenTime: (() => void) | null = null;
     let unlistenLoaded: (() => void) | null = null;
@@ -952,23 +1006,23 @@ useEffect(() => {
       if (resumeAppliedRef.current) return;
       resumeAppliedRef.current = true;
       const prefs = prefsRef.current;
-      void TauriService.mpvSetVolume(prefs.isMuted ? 0 : prefs.volume * 100).catch(() => {});
-      void TauriService.mpvSetSpeed(prefs.playbackRate).catch(() => {});
+      void TauriService.vlcSetVolume(prefs.isMuted ? 0 : prefs.volume * 100).catch(() => {});
+      void TauriService.vlcSetSpeed(prefs.playbackRate).catch(() => {});
       const resume = pendingResumeRef.current;
       if (resume != null) {
         pendingResumeRef.current = null;
-        // Go through the unified funnel: pipeline flush → mpv seek.
+        // Go through the unified funnel: pipeline flush → VLC seek.
         seekNativeRef.current(resume);
       }
     };
 
     void (async () => {
-      unlistenTime = await listen<MpvTimeUpdatePayload>("mpv-timeupdate", (event) => {
+      unlistenTime = await listen<VlcTimeUpdatePayload>("vlc-timeupdate", (event) => {
         if (disposed) return;
         const { position = 0, duration = 0, paused = false, ended = false } =
           event.payload ?? {};
         const clamped = Math.max(0, position);
-        setMpvClock({ position: clamped, duration: Math.max(0, duration) });
+        setVlcClock({ position: clamped, duration: Math.max(0, duration) });
         setCurrentTime(clamped);
         if (duration > 0 || clamped > 0) nativeDecodeProvenRef.current = true;
         if (ended) {
@@ -979,7 +1033,7 @@ useEffect(() => {
         recordPlaybackRef.current();
         if (duration > 0) applyNativePrefsAndResume();
       });
-      unlistenLoaded = await listen("mpv-loaded", () => {
+      unlistenLoaded = await listen("vlc-loaded", () => {
         if (disposed) return;
         nativeLoadedRef.current = true;
         applyNativePrefsAndResume();
@@ -990,21 +1044,21 @@ useEffect(() => {
       disposed = true;
       unlistenTime?.();
       unlistenLoaded?.();
-      void TauriService.mpvStop().catch(() => {});
+      void TauriService.vlcStop().catch(() => {});
     };
-    // Registers/unregisters only when the engine actually switches to mpv.
+    // Registers/unregisters only when the engine actually switches to VLC.
   }, [engine]);
 
-  // Keep the embedded mpv surface glued to the PlayerViewport. App shell layout
+  // Keep the embedded VLC surface glued to the PlayerViewport. App shell layout
   // owns the viewport (`[data-player-viewport]` — the content column right of
   // the sidebar on desktop, the full-window column under a mobile drawer); the
-  // Player consumes its rect VERBATIM for `mpv_set_layout`. The Player never
+  // Player consumes its rect VERBATIM for `vlc_set_layout`. The Player never
   // measures the sidebar, never subtracts it, never clamps — App shell flex
   // already placed this column, so the measured rect below IS the region. Any
   // layout change (window drag/resize, sidebar reflow, fullscreen toggle,
   // manual container resizing) re-anchors through the viewport's
   // ResizeObserver plus explicit `resize` / `fullscreenchange` listeners, all
-  // coalesced into at most one rAF per frame; `mpv-loaded` re-asserts right
+  // coalesced into at most one rAF per frame; `vlc-loaded` re-asserts right
   // after a fresh host is created. IPC is coalesced to whole CSS pixels so it
   // never spams the backend.
   //
@@ -1012,7 +1066,7 @@ useEffect(() => {
   // NO native layout (graceful missing-element handling) and retries once per
   // frame until the viewport mounts.
   useEffect(() => {
-    if (!isTauri() || engine !== "mpv") return;
+    if (!isTauri() || engine !== "VLC") return;
     // Layout debug outlines: one-shot paint when ZANPLAYER_NATIVE_LAYOUT_DEBUG=1
     // is active. DOM colors — red = PlayerViewport, blue = sidebar, green =
     // video layer (native stage / HTML5 <video>), yellow = subtitles — are
@@ -1040,15 +1094,25 @@ useEffect(() => {
     let lastKey = "";
     let viewportObserver: ResizeObserver | null = null;
     let unlistenLoaded: (() => void) | null = null;
-    // EVENT-DRIVEN: every trigger funnels into `scheduleLayout`, coalescing
+    let unlistenFullscreen: (() => void) | null = null;
+    let unsubSidebar: (() => void) | null = null;
+// EVENT-DRIVEN: every trigger funnels into `scheduleLayout`, coalescing
     // into at most one animation frame. `report()` re-measures the viewport and
     // dispatches a rect only when the geometry actually changes
     // (`key === lastKey` short-circuits), so once anchored the page jumps to
     // idle instead of burning 60fps forever. Triggers: the viewport resizing
     // (ResizeObserver), window resize, fullscreen toggle, and a freshly mounted
-    // host after a file load (`mpv-loaded`). Sidebar toggles are covered by the
-    // viewport ResizeObserver — App shell reflows the column, the box slides,
-    // RO reports it. The Player never subscribes to sidebar state.
+    // host after a file load (`vlc-loaded`). Sidebar toggles get TWO redundant
+    // triggers that do not depend on the viewport RO firing at all:
+    //   1. a zustand store subscription fired synchronously at the `set`
+    //      (a sidebar position-flip reflows the content row without necessarily
+    //      resizing the observed element — RO can miss it), and
+    //   2. `sidebarVisible` as an effect dependency, so the effect also re-runs
+    //      after the committed sidebar DOM and reports synchronously on entry.
+    //   1 fires on the store write, 2 re-measures after commit — lastKey/rAF
+    //   coalescing dedupe the overlap. This is a belt-and-suspenders last
+    //   resort trigger; the verbatim-contract + right-of-sidebar clamps below
+    //   still govern the rect.
     const scheduleLayout = () => {
       if (disposed || pending) return;
       pending = true;
@@ -1088,18 +1152,46 @@ useEffect(() => {
       // an identity in every correct state (the verbatim contract holds). It
       // only re-anchors a stale or mid-toggle column rect that would otherwise
       // let the video bleed under the sidebar. Drawer mode (mobile) is untouched.
+      //
+      // REDUNDANT SIDEBAR-BOUNDARY CLAMP: after `enforceRightOfSidebar` (which
+      // corrects a stale viewport rect), we perform a second pass that reads
+      // the sidebar's LIVE right edge and forces `rect.x >= right` when the
+      // sidebar is inline. This guards against:
+      //   1. A mid-transition `getBoundingClientRect()` that reports a
+      //      viewport X still at 0 (the sidebar CSS hasn't reflowed yet).
+      //   2. The `enforceRightOfSidebar` function operating on a stale
+      //      `s.right` that doesn't match the current DOM state.
+      //   3. Any future change to the sidebar detection that could bypass
+      //      the primary invariant.
       let boundary: SidebarBoundary | null = null;
       const sidebar = document.querySelector<HTMLElement>("[data-sidebar]");
+      let sidebarRightEdge = 0;
+      let sidebarIsInline = false;
       if (sidebar) {
         const s = sidebar.getBoundingClientRect();
         if (s.width >= 1 && s.right > 0) {
+          sidebarRightEdge = Math.round(s.right);
+          sidebarIsInline = getComputedStyle(sidebar).position !== "absolute";
           boundary = {
-            right: s.right,
-            inline: getComputedStyle(sidebar).position !== "absolute",
+            right: sidebarRightEdge,
+            inline: sidebarIsInline,
           };
         }
       }
       rect = enforceRightOfSidebar(rect, boundary);
+      // SECOND PASS: re-read the sidebar's live right edge and clamp rect.x.
+      // If the sidebar is inline and rect.x still falls left of its right
+      // edge, shift the rect right and reduce width accordingly. This is the
+      // final safety net — the native layer MUST NOT bleed under the sidebar.
+      if (sidebarIsInline && sidebarRightEdge > 0 && rect.x < sidebarRightEdge) {
+        const shift = sidebarRightEdge - rect.x;
+        rect = {
+          x: sidebarRightEdge,
+          y: rect.y,
+          width: Math.max(0, rect.width - shift),
+          height: rect.height,
+        };
+      }
       if (rect.width < 1 || rect.height < 1) {
         scheduleLayout();
         return;
@@ -1109,18 +1201,24 @@ useEffect(() => {
       lastKey = key;
       if (sessionStorage.getItem("zanplayerTrace") === "1") {
         console.debug(
-          "[mpv-layout-js]",
+          "[VLC-layout-js]",
           `viewport=(${rect.x},${rect.y}) ${rect.width}x${rect.height}`
         );
       }
-      void TauriService.mpvSetLayout(rect).catch(() => {});
+      void TauriService.vlcSetLayout(rect).catch(() => {});
     };
     // Initial anchor — synchronous so the very first established frame keeps the
     // host exactly on the viewport, independent of any pending animation frame.
     report();
     if (typeof requestAnimationFrame !== "function") return;
     window.addEventListener("resize", scheduleLayout);
-    document.addEventListener("fullscreenchange", scheduleLayout);
+    // Fullscreen re-anchors SYNCHRONOUSLY (not via a queued rAF): the moment
+    // the fullscreen element engages, the viewport may already have the new
+    // size — an async report could leave the native host on the OLD rect for
+    // one frame, which on macOS paints as a black/shrunk stage while the
+    // fullscreen space animates in. Reading the committed rect here keeps the
+    // Metal surface glued to the stage through the transition.
+    document.addEventListener("fullscreenchange", report);
     if (typeof ResizeObserver !== "undefined") {
       viewportObserver = new ResizeObserver(scheduleLayout);
       const vp = document.querySelector<HTMLElement>("[data-player-viewport]");
@@ -1129,33 +1227,50 @@ useEffect(() => {
     // A freshly loaded file creates a new native host — re-assert the anchor
     // right after so the newly created surface lands on the measured rect
     // rather than wherever the previous host was left.
-    void listen("mpv-loaded", () => {
+    void listen("vlc-loaded", () => {
       if (!disposed) scheduleLayout();
     }).then((fn) => {
       unlistenLoaded = fn;
+    });
+    // Tauri window fullscreen does NOT fire the DOM `fullscreenchange` event
+    // (the document element never goes fullscreen) — the backend emits
+    // `zan-fullscreen` when it calls `set_fullscreen`. Re-anchor synchronously
+    // on that too, so the Metal surface tracks the Space transition the same
+    // way the DOM path does.
+    void listen<boolean>(WINDOW_FULLSCREEN_EVENT, () => {
+      if (!disposed) report();
+    }).then((fn) => {
+      unlistenFullscreen = fn;
+    });
+    // Sidebar toggle → immediate re-anchor (see comment on `scheduleLayout`):
+    // fires at the store write, before/instead of any (possibly missed) RO.
+    unsubSidebar = useAppStore.subscribe((state, prev) => {
+      if (!disposed && state.sidebarVisible !== prev.sidebarVisible) scheduleLayout();
     });
     return () => {
       disposed = true;
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", scheduleLayout);
-      document.removeEventListener("fullscreenchange", scheduleLayout);
+      document.removeEventListener("fullscreenchange", report);
       viewportObserver?.disconnect();
       unlistenLoaded?.();
+      unlistenFullscreen?.();
+      unsubSidebar?.();
     };
-  }, [engine]);
+  }, [engine, sidebarVisible]);
 
-  // Cutover guard: if mpv ever loses the embedded surface (the backend emits
-  // `mpv-embed-lost` the moment the wid stops resolving to our host surface),
+  // Cutover guard: if VLC ever loses the embedded surface (the backend emits
+  // `vlc-embed-lost` the moment the wid stops resolving to our host surface),
   // the rogue floating window must never masquerade as in-app playback — fall
   // straight back to HTML5 so the user keeps a working, embedded picture.
   useEffect(() => {
-    if (!isTauri() || engine !== "mpv") return;
+    if (!isTauri() || engine !== "VLC") return;
     let disposed = false;
     let unlistenEmbedLost: (() => void) | null = null;
     void (async () => {
-      unlistenEmbedLost = await listen("mpv-embed-lost", () => {
+      unlistenEmbedLost = await listen("vlc-embed-lost", () => {
         if (disposed) return;
-        console.error("Native mpv surface lost — falling back to HTML5");
+        console.error("Native VLC surface lost — falling back to HTML5");
         nativeLoadedRef.current = false;
         resumeAppliedRef.current = false;
         setEngine("html5");
@@ -1178,16 +1293,16 @@ useEffect(() => {
     };
   }, [engine, currentVideoPath]);
 
-  // Native decode watchdog: `loadfile` returns OK for a file mpv ultimately
+  // Native decode watchdog: `loadfile` returns OK for a file VLC ultimately
   // cannot demux/decode (renamed path, corrupt container, headless codec), so
-  // no `mpv-load` error ever surfaces — the player would strand on a silent
-  // black frame. mpv's 250 ms ticker only emits one (0, 0) snapshot for such a
+  // no `VLC-load` error ever surfaces — the player would strand on a silent
+  // black frame. VLC's 250 ms ticker only emits one (0, 0) snapshot for such a
   // file, so if its clock never proves itself (any real duration or playhead
   // — tracked in `nativeDecodeProvenRef` by the clock-mirror listener) within
   // the grace window, cut back to the HTML5 blob engine the same way an embed
   // loss would. Its own failure surfaces then (codec hint / onError).
   useEffect(() => {
-    if (!isTauri() || engine !== "mpv" || !currentVideoPath) return;
+    if (!isTauri() || engine !== "VLC" || !currentVideoPath) return;
     nativeDecodeProvenRef.current = false;
     let disposed = false;
     const timer = window.setTimeout(() => {
@@ -1196,7 +1311,7 @@ useEffect(() => {
       nativeLoadedRef.current = false;
       resumeAppliedRef.current = false;
       console.error(
-        "Native mpv clock never decoded the file — falling back to HTML5"
+        "Native VLC clock never decoded the file — falling back to HTML5"
       );
       setEngine("html5");
       TauriService.getVideoBlobUrl(currentVideoPath)
@@ -1236,7 +1351,7 @@ useEffect(() => {
 
   // Handle video source management & engine selection. A browser-supplied
   // URL always uses the HTML5 engine; a filesystem path (Tauri) prefers the
-  // native mpv surface and falls back to an HTML5 blob URL on any failure.
+  // native VLC surface and falls back to an HTML5 blob URL on any failure.
   // When both a URL and a path are present (recent-history / library clicks),
   // the path wins so native playback is not bypassed by a pre-fetched blob.
   useEffect(() => {
@@ -1263,10 +1378,11 @@ useEffect(() => {
           console.error("Native player availability check failed:", err);
         }
         if (!isMounted) return;
+        setNativeAvailable(useNative);
         if (useNative) {
-          setEngine("mpv");
+          setEngine("VLC");
           try {
-            await TauriService.mpvLoad(currentVideoPath);
+            await TauriService.vlcLoad(currentVideoPath);
           } catch (err) {
             console.error("Native playback failed; falling back to HTML5:", err);
             if (!isMounted) return;
@@ -1340,9 +1456,9 @@ useEffect(() => {
     setVideoLoadError(null);
     if (engine !== "html5") return;
     const name = currentVideo?.name ?? currentVideoPath?.split(/[\\/]/).pop() ?? "";
-    const hint = html5UnsupportedHint(name);
+    const hint = html5UnsupportedHint(name, nativeAvailable);
     if (hint) setVideoLoadError(hint);
-  }, [engine, currentVideoPath, currentVideo]);
+  }, [engine, currentVideoPath, currentVideo, nativeAvailable]);
 
   const applyOutputMode = (mode: "original" | "english" | "both") => {
     setSubtitleMode(mode);
@@ -1357,7 +1473,7 @@ useEffect(() => {
   };
 
   // Open a previously-watched video from the home-screen recent list. The
-  // file is loaded through the regular engine pipeline (native mpv, or the
+  // file is loaded through the regular engine pipeline (native VLC, or the
   // HTML5 blob-URL fallback) purely by setting the path; a one-shot `resumeAt`
   // field is then dispatched so the player seeks to the saved playhead once
   // the media actually loads.
@@ -1393,7 +1509,7 @@ useEffect(() => {
   const applyPlaybackRate = (rate: number) => {
     setPlaybackRate(rate);
     if (isNative) {
-      void TauriService.mpvSetSpeed(rate).catch(() => {});
+      void TauriService.vlcSetSpeed(rate).catch(() => {});
     } else if (videoRef.current) {
       videoRef.current.playbackRate = rate;
     }
@@ -1414,8 +1530,8 @@ useEffect(() => {
   return (
     <div
       className={cn(
-        "relative w-full h-full group overflow-clip",
-        // Native mpv draws behind the transparent webview stage, so the player
+        "relative w-full h-full group isolate overflow-clip",
+        // Native VLC draws behind the transparent webview stage, so the player
         // root must stay transparent; HTML5 keeps an opaque letterbox.
         isNative ? "" : "bg-black"
       )}
@@ -1426,17 +1542,33 @@ useEffect(() => {
         e.dataTransfer.dropEffect = "copy";
       }}
     >
-      {isNative || videoSource ? (
+      {hasMedia ? (
         <>
+          {/* ==== STRICT Z-LAYER (DOM overlay stack, native mode) ====
+              z-0   video surface (native LibVLC host frame / <video>)
+              z-10  video title OSD gradient        (pointer-events-none)
+              z-20  play/pause toggle capture layer (pointer-events AUTO —
+                    this is the mid-video click target that calls togglePlay)
+              z-[25] fallback-load error toast      (pointer-events-none)
+              z-30  subtitles + CC/speed popovers   (subtitles pointer-events-none,
+                    popovers interactive)
+              z-40  controls bar (pointer-events only while VISIBLE, so an
+                    auto-hidden bar can never eat a play/pause click)
+              The DOM chrome always floats ABOVE the native surface: on macOS
+              the LibVLC-host NSView is a SIBLING BELOW the transparent
+              webview in the window content view, so every one of these layers
+              draws in the webview, over the decoded picture. `pointer-events-
+              none` on the base stage stays on so the host frame never
+              intercepts a pointer event ahead of a DOM control. */}
           {isNative ? (
             <div
               ref={nativeStageRef}
-              className="relative z-0 w-full h-full overflow-clip"
+              className="relative z-0 w-full h-full overflow-clip pointer-events-none"
               role="group"
               aria-label="Native video surface"
               data-native-stage
             >
-              {/* Clear placeholder for the native stage: mpv renders its video
+              {/* Clear placeholder for the native stage: VLC renders its video
                   view INTO this region, below the transparent webview layer.
                   The root stays transparent (no background class) so the
                   decoded frames show through behind the DOM overlay stack. */}
@@ -1450,8 +1582,15 @@ useEffect(() => {
               const s = useAppStore.getState();
               const name =
                 s.currentVideo?.name ?? s.currentVideoPath?.split(/[\\/]/).pop() ?? "";
+              // Containers that CAN'T be demuxed get the tailored hint; a decode
+              // failure of an "HTML5-playable" container (e.g. MOV/HEVC that
+              // WebKit rejects) gets an equally actionable prompt instead of the
+              // old dead-end generic string.
               setVideoLoadError(
-                html5UnsupportedHint(name) ?? "This file failed to play in the fallback player."
+                html5UnsupportedHint(name, nativeAvailable) ??
+                  (nativeAvailable
+                    ? "This file failed to decode in the fallback player — the native engine couldn't play it either. Try converting it to MP4 (H.264)."
+                    : "This file failed to decode in the fallback player. Convert it to MP4 (H.264), or use a ZanPlayer build with the native engine enabled.")
               );
             }}
             onTimeUpdate={handleTimeUpdate}
@@ -1501,11 +1640,13 @@ useEffect(() => {
             </div>
           )}
 
-          {/* Video Title OSD — fades in/out with the control bar */}
+          {/* Video Title OSD — fades in/out with the control bar. Flat solid black
+              backing (no fading gradient) so the white title text has crisp
+              contrast over any frame. */}
           {videoTitle && (
             <div
               className={cn(
-                "absolute top-0 left-0 right-0 bg-gradient-to-b from-black/80 to-transparent px-6 py-4 transition-opacity duration-300 pointer-events-none z-10",
+                "absolute top-0 left-0 right-0 bg-black px-6 py-4 transition-opacity duration-300 pointer-events-none z-10",
                 showControls ? "opacity-100" : "opacity-0"
               )}
             >
@@ -1587,18 +1728,28 @@ useEffect(() => {
             onClick={togglePlay}
           >
             {!isPlaying && (
-              <div className="w-20 h-20 bg-white/20 rounded-full flex items-center justify-center backdrop-blur-sm">
+              <div className="w-20 h-20 bg-black/75 backdrop-blur rounded-full flex items-center justify-center border border-white/25 shadow-xl">
                 <Play className="w-10 h-10 text-white ml-1" />
               </div>
             )}
           </div>
 
-          {/* Fallback-load error overlay — a container the HTML5 engine can't
-              demux fails loudly instead of as a silent black frame. */}
+          {/* Fallback-load error overlay — a container the HTML5 engine can't demux
+            fails loudly instead of as a silent black frame. SOLID opaque card
+            (zan-black, never a translucent/gradient value) so the message stays
+            fully legible over the black stage in both engines, and
+            pointer-events-none so it never blocks the controls underneath.
+            `data-load-error` + index.css pin the same contract raw. */}
           {videoLoadError && (
-            <div className="absolute inset-0 z-[25] flex items-center justify-center px-8 pointer-events-none">
-              <div className="max-w-xl text-center bg-black/70 backdrop-blur rounded-xl border border-red-900/60 px-6 py-5">
-                <p className="text-red-400 text-sm leading-relaxed break-words">{videoLoadError}</p>
+            <div
+              className="absolute inset-0 z-[25] flex items-center justify-center px-8 pointer-events-none"
+              data-load-error
+            >
+              <div className="isolate max-w-xl text-center bg-zan-black rounded-xl border border-red-500/80 px-6 py-5 shadow-2xl">
+                <p className="text-red-400 text-sm font-semibold uppercase tracking-wide mb-2">
+                  Playback unavailable in this build
+                </p>
+                <p className="text-zinc-100 text-sm leading-relaxed break-words">{videoLoadError}</p>
               </div>
             </div>
           )}
@@ -1614,13 +1765,28 @@ useEffect(() => {
             </div>
           )}
 
-          {/* Controls Bar — top overlay layer for all DOM chrome. */}
-          <div
-            className={cn(
-              "absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-6 py-4 transition-opacity duration-300 z-40",
-              showControls ? "opacity-100" : "opacity-0"
-            )}
-          >
+          {/* Controls Bar — top overlay layer for all DOM chrome. Pointer
+              events stay ENABLED only while the bar is visible: an auto-hidden
+              (opacity-0) bar must not swallow pause/resume clicks, so hidden
+              clicks fall through to the z-20 play/pause capture layer, and
+              moving the mouse re-enables the bar. */}
+            <div
+              data-controls-bar
+              className={cn(
+                // `isolate` makes the bar a self-contained stacking context:
+                // its z-40 never re-parents under a sibling overlay, and the
+                // bar can never be clipped or hidden by a parent stacking
+                // change. The wrapper uses a FLAT, fully solid background
+                // (no translucent/fading gradient) so the white control icons,
+                // timeline sliders and text render with 100% crisp contrast
+                // over any frame — a gradient's transparent far edge turned
+                // them into faint ghost outlines on bright video. index.css
+                // ALSO pins [data-controls-bar] to solid black with !important
+                // as a raw backstop.
+                "absolute bottom-0 left-0 right-0 isolate bg-black px-6 py-4 transition-opacity duration-300 z-40",
+                showControls ? "opacity-100 pointer-events-auto" : "opacity-0 pointer-events-none"
+              )}
+            >
             {/* Progress Bar */}
             <div className="mb-4">
               <input
@@ -1629,9 +1795,9 @@ useEffect(() => {
                 max={durationClock || 100}
                 value={currentClock}
                 onChange={handleSeek}
-                className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-zan-cyan"
+                className="w-full h-1 bg-gray-500 rounded-lg appearance-none cursor-pointer accent-zan-cyan"
               />
-              <div className="flex justify-between text-xs text-gray-300 mt-1">
+              <div className="flex justify-between text-xs text-zinc-100 mt-1">
                 <span>{formatTime(currentClock)}</span>
                 <span>{formatTime(durationClock)}</span>
               </div>
@@ -1689,7 +1855,7 @@ useEffect(() => {
                       "flex items-center justify-center py-0.5 px-2 rounded-[4px] border transition-colors text-xs font-semibold",
                       showSpeedMenu
                         ? "text-zan-cyan border-zan-cyan/70 bg-zan-cyan/10"
-                        : "text-white/80 border-white/70 hover:text-zan-cyan hover:border-zan-cyan/70"
+                        : "text-white border-white hover:text-zan-cyan hover:border-zan-cyan/70"
                     )}
                     title="Playback speed"
                   >
@@ -1697,7 +1863,7 @@ useEffect(() => {
                   </button>
 
                   {showSpeedMenu && (
-                    <div className="absolute bottom-full right-0 mb-3 z-30 bg-zan-black/95 backdrop-blur rounded-xl shadow-2xl border border-gray-700 min-w-[130px] overflow-hidden">
+                    <div className="absolute bottom-full right-0 mb-3 z-30 bg-zan-black rounded-xl shadow-2xl border border-gray-700 min-w-[130px] overflow-hidden">
                       {SPEED_RATES.map((rate) => (
                         <button
                           key={rate}
@@ -1732,7 +1898,7 @@ useEffect(() => {
                       "flex items-center justify-center py-0.5 px-1 rounded-[4px] border transition-colors",
                       showSubtitles
                         ? "text-zan-cyan border-zan-cyan/70 hover:bg-zan-cyan/10"
-                        : "text-white/80 border-white/70 hover:text-zan-cyan hover:border-zan-cyan/70"
+                        : "text-white border-white hover:text-zan-cyan hover:border-zan-cyan/70"
                     )}
                     title={showSubtitles ? "Subtitle Settings" : "Show Subtitles"}
                   >
@@ -1740,7 +1906,7 @@ useEffect(() => {
                   </button>
 
                   {showCCMenu && (
-                    <div className="absolute bottom-full right-0 mb-3 z-30 bg-zan-black/95 backdrop-blur rounded-xl shadow-2xl border border-gray-700 min-w-[220px] overflow-hidden">
+                    <div className="absolute bottom-full right-0 mb-3 z-30 bg-zan-black rounded-xl shadow-2xl border border-gray-700 min-w-[220px] overflow-hidden">
                       {ccMenuView === "source" ? (
                         <>
                           <div className="flex items-center px-2 py-2 border-b border-gray-700">
@@ -1958,7 +2124,7 @@ useEffect(() => {
                   </button>
 
                   {showQuickSettings && (
-                    <div className="absolute bottom-28 right-0 z-50 w-72 bg-zan-black/95 backdrop-blur rounded-xl shadow-2xl border border-gray-700 p-4">
+                    <div className="absolute bottom-28 right-0 z-50 w-72 bg-zan-black rounded-xl shadow-2xl border border-gray-700 p-4">
                       <h3 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
                         <Settings2 className="w-4 h-4" />
                         Quick Settings

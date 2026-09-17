@@ -99,10 +99,15 @@ impl VlcSession {
     /// lifetime (until `stop`), so a second `load` never spawns a duplicate.
     pub fn load(&self, app: &AppHandle, path: &str) -> Result<(), String> {
         {
-let mut player =
+            let mut player =
                 self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             player.set_drawable(self.drawable as *mut std::ffi::c_void);
             player.load(path)?;
+            // `load` starts the file: `libvlc_media_player_set_media` alone
+            // leaves the pipeline in NothingSpecial — the demux/decode path only
+            // runs once `play` is issued, which is exactly what the smoke
+            // battery (checks 5-7) and the autoplay flow depend on.
+            player.play();
         }
 
         if !self.ticking.swap(true, Ordering::SeqCst) {
@@ -444,6 +449,35 @@ pub(crate) mod macos_surface {
         }
     }
 
+    /// Run an AppKit-touching closure on the main thread. View hierarchy
+    /// mutations (`addSubview:`, `setFrame:`, `setNeedsDisplay:`) are
+    /// main-thread-only in AppKit; calling them from the session ticker, the
+    /// smoke thread, or a Tauri async command handler is undefined behaviour and
+    /// segfaults on macOS. If already on the main thread this runs directly;
+    /// otherwise the closure is posted to the AppKit main loop and the caller
+    /// blocks (bounded) for its result. Only the returned value crosses the
+    /// channel — never Objective-C pointers (`*mut AnyObject` is not `Send`) —
+    /// so callers transport any touched pointers as `i64` handles instead.
+    fn on_main<R, F>(app: &tauri::AppHandle, f: F) -> Result<R, String>
+    where
+        R: Send + 'static,
+        F: FnOnce(&tauri::AppHandle) -> R + Send + 'static,
+    {
+        unsafe extern "C" {
+            fn pthread_main_np() -> i32;
+        }
+        if unsafe { pthread_main_np() != 0 } {
+            return Ok(f(app));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let _ = tx.send(f(&handle));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|e| format!("macOS main-thread handoff timed out: {e}"))
+    }
+
     /// The window content view that hosts both the WKWebView and our host view.
     pub fn content_view(app: &tauri::AppHandle) -> Result<*mut AnyObject, String> {
         let surface = window_surface(app)?;
@@ -482,6 +516,18 @@ pub(crate) mod macos_surface {
     /// leaked deliberately (it lives for the app's lifetime). Layer-backed and
     /// retina-scaled, inserted below the WKWebView so DOM chrome stays above.
     pub fn host_view(app: &tauri::AppHandle) -> Result<*mut AnyObject, String> {
+        // AppKit alloy: creating/inserting the host view (`new`, `addSubview:`,
+        // `setWantsLayer:`, `setFrame:`) is main-thread-only. Callers reach this
+        // from the smoke thread, the session ticker, and async Tauri commands,
+        // so marshal the creation itself onto the AppKit main loop; the pointer
+        // is transported as an opaque i64 handle (raw ObjC pointers are not
+        // `Send` and must never cross the channel).
+        let handle = on_main(app, |app| host_view_impl(app).map(|v| v as i64))??;
+        Ok(handle as *mut AnyObject)
+    }
+
+    /// (main-thread-only body of `host_view` — never call off the main thread)
+    fn host_view_impl(app: &tauri::AppHandle) -> Result<*mut AnyObject, String> {
         let mut guard = HOST_VIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(view) = *guard {
             if !view.0.is_null() {
@@ -536,7 +582,12 @@ pub(crate) mod macos_surface {
     /// non-degenerate region — the precondition that makes an embedded (never
     /// detached) VLC. Checked before init so a broken anchor fails the session.
     pub fn verify_embedded(app: &tauri::AppHandle) -> bool {
-        let host = match host_view(app) {
+        on_main(app, verify_embedded_impl).unwrap_or(false)
+    }
+
+    /// (main-thread-only body of `verify_embedded`)
+    fn verify_embedded_impl(app: &tauri::AppHandle) -> bool {
+        let host = match host_view_impl(app) {
             Ok(host) => host,
             Err(_) => return false,
         };
@@ -564,8 +615,13 @@ pub(crate) mod macos_surface {
     /// `apply_layout`). Used by the smoke harness to assert the rendered frame
     /// — not the requested rect — matches the DOM stage.
     pub fn applied_js_rect(app: &tauri::AppHandle) -> Result<(f64, f64, f64, f64), String> {
+        on_main(app, applied_js_rect_impl)?
+    }
+
+    /// (main-thread-only body of `applied_js_rect`)
+    fn applied_js_rect_impl(app: &tauri::AppHandle) -> Result<(f64, f64, f64, f64), String> {
         let content = content_view(app)?;
-        let host = host_view(app)?;
+        let host = host_view_impl(app)?;
         let webview = webview_view(content)?;
         unsafe {
             let bounds: NSRect = msg_send![webview, bounds];
@@ -588,6 +644,11 @@ pub(crate) mod macos_surface {
     /// the webview origin) is passed through faithfully; Y is flipped for the
     /// content view's bottom-left origin.
     pub fn apply_layout(app: &tauri::AppHandle, rect: SurfaceLayout) -> Result<(), String> {
+        on_main(app, move |app| apply_layout_impl(app, rect))?
+    }
+
+    /// (main-thread-only body of `apply_layout`)
+    fn apply_layout_impl(app: &tauri::AppHandle, rect: SurfaceLayout) -> Result<(), String> {
         let rect = sanitize_surface_layout(rect);
         // A degenerate or not-yet-laid-out stage must never move the surface to
         // (0,0)/zero size (the "video stuck at the top-left" symptom): keep the
@@ -596,7 +657,7 @@ pub(crate) mod macos_surface {
             return Ok(());
         }
         let content = content_view(app)?;
-        let host = host_view(app)?;
+        let host = host_view_impl(app)?;
         let webview = webview_view(content)?;
         unsafe {
             let bounds: NSRect = msg_send![webview, bounds];

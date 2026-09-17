@@ -55,7 +55,8 @@ extern "C" {
     fn libvlc_release(inst: *mut libvlc_instance_t);
     fn libvlc_media_new_path(inst: *mut libvlc_instance_t, path: *const c_char) -> *mut libvlc_media_t;
     fn libvlc_media_release(md: *mut libvlc_media_t);
-    fn libvlc_media_player_new_from_media(md: *mut libvlc_media_t) -> *mut libvlc_media_player_t;
+    fn libvlc_media_player_new(inst: *mut libvlc_instance_t) -> *mut libvlc_media_player_t;
+    fn libvlc_media_player_set_media(mp: *mut libvlc_media_player_t, md: *mut libvlc_media_t);
     fn libvlc_media_player_release(mp: *mut libvlc_media_player_t);
     fn libvlc_media_player_play(mp: *mut libvlc_media_player_t) -> c_int;
     fn libvlc_media_player_pause(mp: *mut libvlc_media_player_t);
@@ -162,7 +163,14 @@ impl VlcPlayer {
         if instance.is_null() {
             return Err("failed to create libvlc instance".into());
         }
-        let player = ptr::null_mut();
+        // One player for the session's lifetime: `load` swaps media via
+        // `libvlc_media_player_set_media` so the embed drawable and input
+        // settings (`set_nsobject`, key/mouse input) survive track changes.
+        let player = unsafe { libvlc_media_player_new(instance) };
+        if player.is_null() {
+            unsafe { libvlc_release(instance) };
+            return Err("failed to create libvlc media player".into());
+        }
         Ok(Self {
             instance,
             player,
@@ -204,13 +212,10 @@ impl VlcPlayer {
         if media.is_null() {
             return Err("libvlc could not open media path".into());
         }
-        // SAFETY: media is a valid handle; the player retains it.
-        let player = unsafe { libvlc_media_player_new_from_media(media) };
+        // SAFETY: media is a valid handle; set_media retains it (the player
+        // holds our reference), then our own refcount is released.
+        unsafe { libvlc_media_player_set_media(self.player, media) };
         unsafe { libvlc_media_release(media) };
-        if player.is_null() {
-            return Err("libvlc could not create media player".into());
-        }
-        self.player = player;
         self.media_set = true;
         // Disable VLC's own subtitle rendering (webview owns captions).
         // SAFETY: player is valid after construction.

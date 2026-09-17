@@ -42,9 +42,11 @@ export async function checkForUpdates(mode: "manual" | "background" = "manual"):
     if (update) {
       currentUpdate = update;
       state.setUpdateVersion(update.version);
+      state.setUpdateNotes(update.body?.trim() || null);
       openModal("available");
     } else if (mode === "manual") {
       currentUpdate = null;
+      state.setUpdateNotes(null);
       openModal("uptodate");
     }
   } catch (error) {
@@ -53,6 +55,7 @@ export async function checkForUpdates(mode: "manual" | "background" = "manual"):
       console.error("Update check failed:", error);
       state.setUpdateModalOpen(false);
       state.setUpdateStatus("idle");
+      state.setUpdateNotes(null);
       const detail = errorDetail(error);
       if (detail.toLowerCase().includes("offline") || detail.toLowerCase().includes("no internet")) {
         await message("No internet connection. Please check your connection and try again.", {
@@ -143,5 +146,6 @@ export function cancelUpdate(): void {
   store.setUpdateStatus("idle");
   store.setDownloadProgress(0);
   store.setUpdateVersion(null);
+  store.setUpdateNotes(null);
   currentUpdate = null;
 }

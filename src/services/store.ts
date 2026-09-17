@@ -226,6 +226,8 @@ interface AppState {
     setDownloadProgress: (progress: number) => void;
     updateVersion: string | null;
     setUpdateVersion: (version: string | null) => void;
+    updateNotes: string | null;
+    setUpdateNotes: (notes: string | null) => void;
 }
 
 export const useAppStore = create<AppState>()(
@@ -577,6 +579,8 @@ export const useAppStore = create<AppState>()(
             setDownloadProgress: (progress: number) => set({ downloadProgress: progress }),
             updateVersion: null,
             setUpdateVersion: (version: string | null) => set({ updateVersion: version }),
+            updateNotes: null,
+            setUpdateNotes: (notes: string | null) => set({ updateNotes: notes }),
         }),
         {
             name: "zanplayer-lite-storage",

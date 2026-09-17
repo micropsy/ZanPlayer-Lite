@@ -2,6 +2,19 @@ import { BadgeCheck, CheckCircle2, Download, DownloadCloud, Loader2, Rocket, X }
 import { useAppStore } from "../services/store";
 import { cancelUpdate, downloadUpdate, installAndRestart } from "../services/updater";
 
+// Lightweight plain-text pass over the markdown release notes that ship in the
+// update manifest (the GitHub release body): strip heading/bold markers so the
+// modal reads cleanly without pulling in a markdown dependency.
+function renderNotes(notes: string | null | undefined): string {
+  if (!notes) return "";
+  return notes
+    .split("\n")
+    .map((line) => line.replace(/^#{1,6}\s*/, "").replace(/\*\*/g, ""))
+    .map((line) => (line.startsWith("- ") ? `• ${line.slice(2)}` : line))
+    .join("\n")
+    .trim();
+}
+
 // Global update prompt. Rendered at the app root so it overlays everything with
 // a blurred backdrop. Driven entirely by the store's updater state machine; the
 // only phase that cannot be dismissed is the active download, to avoid leaving
@@ -11,6 +24,7 @@ export const UpdateModal = () => {
   const updateStatus = useAppStore((s) => s.updateStatus);
   const downloadProgress = useAppStore((s) => s.downloadProgress);
   const updateVersion = useAppStore((s) => s.updateVersion);
+  const updateNotes = useAppStore((s) => s.updateNotes);
 
   if (!updateModalOpen) return null;
 
@@ -61,10 +75,16 @@ export const UpdateModal = () => {
             <span className="bg-blue-500/20 text-blue-400 px-2 py-1 rounded text-xs font-medium mt-3">
               v{updateVersion}
             </span>
-            <p className="text-sm text-gray-400 mt-2 leading-relaxed max-w-[300px]">
-              A new version of ZanPlayer Lite is ready to download. Get the latest features and
-              improvements now.
-            </p>
+            {updateNotes && (
+              <div className="mt-4 w-full text-left">
+                <div className="text-[11px] uppercase tracking-wider text-gray-500 font-medium mb-1.5">
+                  What's new
+                </div>
+                <div className="max-h-40 overflow-y-auto rounded-lg bg-black/30 border border-white/5 p-3 text-xs text-gray-300 whitespace-pre-wrap leading-relaxed">
+                  {renderNotes(updateNotes)}
+                </div>
+              </div>
+            )}
             <div className="flex gap-2 w-full mt-6">
               <button
                 onClick={cancelUpdate}
@@ -117,6 +137,16 @@ export const UpdateModal = () => {
             <span className="bg-green-500/20 text-green-400 px-2 py-1 rounded text-xs font-medium mt-3">
               v{updateVersion}
             </span>
+            {updateNotes && (
+              <div className="mt-4 w-full text-left">
+                <div className="text-[11px] uppercase tracking-wider text-gray-500 font-medium mb-1.5">
+                  What's new
+                </div>
+                <div className="max-h-40 overflow-y-auto rounded-lg bg-black/30 border border-white/5 p-3 text-xs text-gray-300 whitespace-pre-wrap leading-relaxed">
+                  {renderNotes(updateNotes)}
+                </div>
+              </div>
+            )}
             <p className="text-sm text-gray-400 mt-2 leading-relaxed max-w-[300px]">
               Your update is ready to install. Restart ZanPlayer Lite to apply the latest changes.
             </p>

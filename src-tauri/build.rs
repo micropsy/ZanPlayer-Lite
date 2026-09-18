@@ -38,8 +38,13 @@ fn main() {
         }
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=dylib=vlc");
-        // @rpath/libvlc.dylib install name: without this the binary links but
-        // the running app fails to load the dylib at startup.
+        // @rpath/libvlc.dylib install name: without these rpaths the binary
+        // links but the running app fails to load the dylib at startup. Order
+        // matters — the BUNDLED copy ships first (`Contents/Resources/vendor/
+        // vlc/lib` inside the .app, staged by scripts/bundle-vlc.sh) so an
+        // installed app is self-contained, then the build-time lib dir (the
+        // system VLC.app) so un-bundled dev builds still resolve.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Resources/vendor/vlc/lib");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
         println!("cargo:rerun-if-env-changed=VLC_PREFIX");
     }

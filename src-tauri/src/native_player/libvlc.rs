@@ -115,6 +115,14 @@ unsafe impl Sync for VlcPlayer {}
 /// `build.rs` discovery so the runtime `--plugin-path` matches the link rpath.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn vlc_plugin_dir() -> Option<std::path::PathBuf> {
+    // A bundled macOS build (Contents/Resources/vendor/vlc, staged by
+    // scripts/bundle-vlc.sh) must use ITS OWN plugin tree: that guarantees the
+    // loaded libvlc and the plugins share one version/arch even when the user
+    // also has a system VLC.app or a VLC_PLUGIN_DIR override.
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = bundled_plugin_dir() {
+        return Some(dir);
+    }
     if let Some(dir) = std::env::var_os("VLC_PLUGIN_DIR") {
         return Some(std::path::PathBuf::from(dir));
     }
@@ -132,6 +140,20 @@ fn vlc_plugin_dir() -> Option<std::path::PathBuf> {
     } else {
         None
     }
+}
+
+/// `Contents/Resources/vendor/vlc/plugins` inside the running .app bundle.
+#[cfg(target_os = "macos")]
+fn bundled_plugin_dir() -> Option<std::path::PathBuf> {
+    let path = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .parent()?
+        .join("Resources")
+        .join("vendor")
+        .join("vlc")
+        .join("plugins");
+    path.is_dir().then_some(path)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

@@ -31,6 +31,10 @@ pub struct VlcSession {
     /// view detaching from the window hierarchy (the VLC analog of the old
     /// `wid` embed gate).
     verified: bool,
+    /// Set true once the ticker has surfaced a host detach via `vlc-embed-lost`
+    /// (one-shot per media load, mirroring the mobile poll-failure path).
+    /// Re-armed by every `load` so a fresh session can notify again.
+    embed_lost: Arc<AtomicBool>,
 }
 
 // SAFETY: libvlc documents its API as thread-safe; the player inner is always
@@ -64,6 +68,7 @@ impl VlcSession {
             ticking: Arc::new(AtomicBool::new(false)),
             drawable,
             verified,
+            embed_lost: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -77,9 +82,8 @@ impl VlcSession {
         }
         #[cfg(target_os = "macos")]
         {
-            // Called from the ticker thread; only reads the cached hierarchy,
-            // never mutates it.
-            !self.verified || macos_surface::host_still_attached()
+            // Read by load/smoke; reflects the latest main-thread host probe.
+            macos_surface::host_still_attached()
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -110,10 +114,16 @@ impl VlcSession {
             player.play();
         }
 
+        // Re-arm the one-shot embed-loss notification so a fresh media load may
+        // surface a detach again (recovery or a second detach both re-notify).
+        self.embed_lost.store(false, Ordering::SeqCst);
+
         if !self.ticking.swap(true, Ordering::SeqCst) {
             let app = app.clone();
             let player = self.player.clone();
             let ticking = self.ticking.clone();
+            let embed_lost = self.embed_lost.clone();
+            let verified = self.verified;
             std::thread::spawn(move || {
                 // Coalesced emission (same contract as the old mpv ticker): a
                 // beat only crosses the bridge when the snapshot actually
@@ -123,6 +133,25 @@ impl VlcSession {
                 while ticking.load(Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(250));
                     keep_webview_on_top(&app);
+                    // Desktop per-beat host probe: the host NSView must stay
+                    // anchored to a live window or the picture would be
+                    // detached. Refresh the attachment cache on the AppKit main
+                    // loop, then surface `vlc-embed-lost` exactly once per load
+                    // when the host disappears — `VideoPlayer.tsx` cuts straight
+                    // to HTML5 on it, same as a mobile poll failure.
+                    #[cfg(target_os = "macos")]
+                    {
+                        macos_surface::probe_attachment(&app);
+                        if should_emit_embed_lost(
+                            verified && macos_surface::host_still_attached(),
+                            &embed_lost,
+                        ) {
+                            let _ = app.emit(
+                                "vlc-embed-lost",
+                                "native host view detached from the window hierarchy",
+                            );
+                        }
+                    }
                     let snapshot = {
                         let player =
                             player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -217,6 +246,17 @@ impl VlcSession {
         let player = self.player.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (player.time_ms().max(0) as f64) / 1000.0
     }
+}
+
+/// Whether this ticker beat must surface `vlc-embed-lost`. True only on the
+/// FIRST detached beat after the flag was armed (a `load`), mirroring the
+/// mobile poll-failure one-shot; attached beats never consume the arm and a
+/// later detach after the once fires stays quiet until the next load re-arms.
+fn should_emit_embed_lost(attached: bool, notified: &AtomicBool) -> bool {
+    if attached {
+        return false;
+    }
+    !notified.swap(true, Ordering::SeqCst)
 }
 
 /// Human name for a libvlc state id.
@@ -382,6 +422,7 @@ pub(crate) mod macos_surface {
     use objc2::encode::{Encode, Encoding};
     use objc2::msg_send;
     use objc2::runtime::{AnyClass, AnyObject};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     pub const NS_WINDOW_ABOVE: i64 = 1;
@@ -585,29 +626,52 @@ pub(crate) mod macos_surface {
         on_main(app, verify_embedded_impl).unwrap_or(false)
     }
 
-    /// (main-thread-only body of `verify_embedded`)
+    /// (main-thread-only body of `verify_embedded` / `probe_attachment`)
     fn verify_embedded_impl(app: &tauri::AppHandle) -> bool {
         let host = match host_view_impl(app) {
             Ok(host) => host,
-            Err(_) => return false,
+            Err(_) => {
+                ATTACHED.store(false, Ordering::SeqCst);
+                return false;
+            }
         };
-        unsafe {
+        let attached = unsafe {
             let superview: *mut AnyObject = msg_send![host, superview];
             let window: *mut AnyObject = msg_send![host, window];
             if superview.is_null() || window.is_null() {
-                return false;
+                false
+            } else {
+                let frame: NSRect = msg_send![host, frame];
+                frame.size.width > 0.0 && frame.size.height > 0.0
             }
-            let frame: NSRect = msg_send![host, frame];
-            frame.size.width > 0.0 && frame.size.height > 0.0
-        }
+        };
+        ATTACHED.store(attached, Ordering::SeqCst);
+        attached
     }
 
-    /// Cheap, lock-free check used by the ticker thread (must NOT touch the
-    /// view hierarchy off the main thread — this only reads cached state that
-    /// was captured before the session existed).
+    /// Cached "host is still anchored to a live window" state, refreshed from
+    /// the AppKit main thread by `verify_embedded_impl` / `probe_attachment` and
+    /// read by the ticker thread — read/write never touches the view hierarchy
+    /// off the main thread.
+    static ATTACHED: AtomicBool = AtomicBool::new(false);
+
+    /// Cheap, lock-free check read by the ticker thread. Returns the result of
+    /// the latest main-thread probe (host superview/window/frame), at most one
+    /// 250 ms beat stale; it MUST NOT touch the view hierarchy itself.
     pub fn host_still_attached() -> bool {
-        let guard = HOST_VIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.map(|v| !v.0.is_null()).unwrap_or(false)
+        ATTACHED.load(Ordering::SeqCst)
+    }
+
+    /// Fire-and-forget per-beat host probe, posted from the ticker thread to
+    /// the AppKit main loop. Re-runs the real hierarchy check (host superview /
+    /// window / non-degenerate frame) and refreshes `ATTACHED`; the next
+    /// `host_still_attached` read picks the result up. The post never blocks
+    /// the ticker, and all AppKit access stays on the main thread.
+    pub fn probe_attachment(app: &tauri::AppHandle) {
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let _ = verify_embedded_impl(&handle);
+        });
     }
 
     /// Read back where the host view ACTUALLY ended up, expressed in the same
@@ -1114,6 +1178,23 @@ mod tests {
         assert_eq!(position_clamped(-4.0, 100.0), 0.0);
         assert_eq!(position_clamped(30.0, 0.0), 30.0);
         assert_eq!(position_clamped(-2.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn embed_lost_notification_fires_exactly_once_per_load() {
+        let notified = AtomicBool::new(false);
+        // Attached beats never notify (and never consume the one-shot arm).
+        assert!(!should_emit_embed_lost(true, &notified));
+        assert!(!should_emit_embed_lost(true, &notified));
+        // First detached beat surfaces the event.
+        assert!(should_emit_embed_lost(false, &notified));
+        // Subsequent detached beats stay quiet until a load re-arms.
+        assert!(!should_emit_embed_lost(false, &notified));
+        assert!(!should_emit_embed_lost(false, &notified));
+        // A fresh load re-arms: recovery or a second detach may notify again.
+        notified.store(false, Ordering::SeqCst);
+        assert!(should_emit_embed_lost(false, &notified));
+        assert!(!should_emit_embed_lost(false, &notified));
     }
 
     #[test]

@@ -43,9 +43,9 @@ the real VLC.app dylibs). A full `.app` bundle + the live macOS runtime smoke
 - This revision's §7 describes the LibVLC model: `set_nsobject` into a dedicated
   host NSView (no Render API / Metal surface), `set_hwnd` (Windows) /
   `set_xwindow` (X11) embed sessions, `VLC_PLUGIN_PATH`, `vlc-embed-ok`
-  (load-time probe) + `vlc-embed-lost` (mobile-only),
-  `vlc-timeupdate` / `vlc-loaded`, and the `applied_js_rect` read-back used in
-  place of the old magenta layer border.
+  (load-time probe) + `vlc-embed-lost` (macOS per-beat host probe + mobile
+  poll-failure), `vlc-timeupdate` / `vlc-loaded`, and the `applied_js_rect`
+  read-back used in place of the old magenta layer border.
 
 ## 3. Implementation audit vs. spec
 
@@ -65,9 +65,9 @@ the real VLC.app dylibs). A full `.app` bundle + the live macOS runtime smoke
 | Embed target | `session.rs` `macos_surface::host_view` | dedicated host NSView below the webview (`NS_WINDOW_BELOW`), `HOST_VIEW` leaked static | ✅ | none |
 | macOS drawable | `session.rs:481` + `libvlc.rs:185` | `libvlc_media_player_set_nsobject(host)` + `set_key_input(0)`/`set_mouse_input(0)` | ✅ | none |
 | Stacking | `session.rs` `keep_webview_on_top` | webview topmost re-asserted per tick + post-load via `run_on_main_thread` (macOS) / Windows SetWindowPos / X11 raise | ✅ | none |
-| Embed probe | `session.rs` `host_still_attached()` + `embed_ok()` | **load-time only**: `vlc-embed-ok` at `load()`; desktop ticker never re-probes; `vlc-embed-lost` is mobile-only | ⚠️ spec said per-beat ticker probe — code is load-time only; desktop cutover still covered by the decode watchdog | doc reworded (this revision) |
+| Embed probe | `session.rs` `host_still_attached()` + `embed_ok()` + `probe_attachment` | `vlc-embed-ok` at `load()`; macOS ticker re-probes the host every beat on the AppKit main loop and emits `vlc-embed-lost` once per load on detach; `vlc-embed-lost` also on mobile poll failure | ✅ matches spec (§ embed-loss watchdogs) | per-beat macOS ticker probe shipped (Todo.md tracked gap closed) |
 | Mobile | `mobile.rs:199` | `apply_surface_layout` deliberate no-op; full-window native behind webview | ✅ | none |
-| Engine cutover | `VideoPlayer.tsx:1121-1271` | watchdog `NATIVE_DECODE_WATCHDOG_MS` → HTML5 (desktop); `vlc-embed-lost` → HTML5 blob (mobile) | ✅ | none |
+| Engine cutover | `VideoPlayer.tsx:1121-1271` | watchdog `NATIVE_DECODE_WATCHDOG_MS` → HTML5 (desktop); `vlc-embed-lost` → HTML5 blob (macOS desktop + mobile) | ✅ | none |
 
 **Forbidden §13 scan:** stale `data-player-area` — none; sidebar tokens in
 player/native geometry — none; VLC embed only into the dedicated host view —

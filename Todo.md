@@ -213,16 +213,21 @@ unsupported functionality.
   Fixed: `libvlc-dev` earlier-eligible apt package + `cargo build --features vlc-native`
   (build.rs links via the pkg-config `libvlc` probe; this doubles as the first
   automated cross-check of the Linux libvlc + X11 FFI arms).
-- [x] **Docs described a per-beat desktop embed-loss probe that the code does not have.**
-  `session.rs` emits `vlc-embed-ok` (carrying `embed_ok()` = `host_still_attached()` on
-  macOS) at `load()` only; the desktop ticker never re-probes and never emits
-  `vlc-embed-lost`. `vlc-embed-lost` is mobile-only (`mobile.rs`, on persistent
+- [x] **Docs described a per-beat desktop embed-loss probe that the code did not have (then).**
+  `session.rs` emitted `vlc-embed-ok` (carrying `embed_ok()` = `host_still_attached()` on
+  macOS) at `load()` only; the desktop ticker did not re-probe and did not emit
+  `vlc-embed-lost`. `vlc-embed-lost` was mobile-only (`mobile.rs`, on persistent
   position-poll failure). AGENTS.md/README/docs reconciled to the real behavior.
-- [ ] **Decide on the per-beat desktop host probe** (tracked gap): add a
-  `host_still_attached()` check on the desktop ticker beat that emits `vlc-embed-lost`
-  once when the host disappears, or accept the 5 s decode watchdog + load-time
-  `vlc-embed-ok` as the only desktop cover. Current frontend parity: `VideoPlayer.tsx`
-  already holds the `vlc-embed-lost` listener, so a backend-side addition is drop-in.
+  **Superseded by the next item, which shipped the per-beat macOS desktop probe.**
+- [x] **Per-beat desktop host probe** (tracked gap, now closed): the macOS desktop
+  ticker refreshes the host-attachment cache on the AppKit main loop every beat
+  (`macos_surface::probe_attachment` — real superview/window/non-degenerate-frame
+  check) and, via `should_emit_embed_lost`, emits `vlc-embed-lost` ONCE per load when
+  the host disappears (re-armed by each `load`, mirroring the mobile poll-failure
+  one-shot). The 5 s decode watchdog + load-time `vlc-embed-ok` remain as the
+  undecodable-file / never-attached cover. Windows/X11 keep `embed_ok() == true`
+  (their per-beat child pin already re-anchors the video). `VideoPlayer.tsx`'s existing
+  `vlc-embed-lost` listener already cut over to HTML5 — no frontend change.
 - [ ] **Re-run the codec decode matrix against libvlc (VLC.app 12.x)** — README table
   is still labeled "libmpv-era result — re-verify with libvlc".
 - [x] **Run the slim smoke battery on a real file** — DONE 2026-09-17 against a real

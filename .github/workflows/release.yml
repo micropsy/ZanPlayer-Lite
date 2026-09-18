@@ -25,11 +25,11 @@ jobs:
         include:
           - platform: macos-x64
             runner: macos-13
-            args: "--bundles app,dmg"
+            args: "--bundles app,dmg --features vlc-native"
             artifact: macos-x64
           - platform: macos-aarch64
             runner: macos-latest
-            args: "--bundles app,dmg"
+            args: "--bundles app,dmg --features vlc-native"
             artifact: macos-aarch64
           - platform: linux-x64
             runner: ubuntu-22.04
@@ -70,6 +70,17 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev
+
+      - name: Install VLC (bundled macOS native engine)
+        if: runner.os == 'macOS'
+        run: brew install --cask vlc
+
+      # Stages /Applications/VLC.app libvlc + plugins into src-tauri/vendor/
+      # so the macOS bundler copies them into the app (self-contained native
+      # engine — shipped macOS builds no longer need VLC installed at runtime).
+      - name: Stage bundled LibVLC
+        if: runner.os == 'macOS'
+        run: bash scripts/bundle-vlc.sh
 
       - name: Fetch FFmpeg static binaries
         shell: bash

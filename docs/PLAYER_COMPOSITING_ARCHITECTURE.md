@@ -239,18 +239,22 @@ Rules:
   scaling) and applied to VLC's child — never to the app window.
 - Wayland: no client-side z-order (compositor-owned); captions may sit under the
   video — a known, documented limitation, not a regression.
-- Embed health on desktop is **load-time only**: `load()` emits `vlc-embed-ok`
-  carrying `embed_ok()` (macOS: cached `host_still_attached()`; always `true` on
-  the HWND/xwindow sessions). The desktop ticker does **not** re-probe the host
-  every beat, and `vlc-embed-lost` is emitted **only** by the mobile plugin
-  (`mobile.rs`) on persistent position-poll failure. Desktop's running-window
-  safety net is the 5 s decode watchdog plus the load-time `vlc-embed-ok` result.
+- Embed health on desktop: `load()` emits `vlc-embed-ok` carrying `embed_ok()`
+  (macOS: the `macos_surface` attachment cache; always `true` on the HWND/xwindow
+  sessions), and the **macOS ticker re-probes the host on every beat**:
+  `probe_attachment` re-runs the real AppKit hierarchy check on the main loop and
+  emits `vlc-embed-lost` once per load if the host detaches. `mobile.rs` also emits
+  `vlc-embed-lost` on persistent position-poll failure. Desktop's running-window
+  safety net is this per-beat probe plus the 5 s decode watchdog plus the load-time
+  `vlc-embed-ok` result.
 
 ### Embed-loss / decode watchdogs
 
-- `vlc-embed-lost` (**mobile-only**) → cut to HTML5 blob URL. A detached/rogue
-  surface is never presented as in-app playback. Desktop relies on the load-time
-  `vlc-embed-ok` result plus the decode watchdog below.
+- `vlc-embed-lost` → cut to HTML5 blob URL. A detached/rogue surface is never
+  presented as in-app playback. Desktop (macOS) emits it once per load from the
+  per-beat host probe; mobile emits it on persistent position-poll failure.
+  Desktop also relies on the load-time `vlc-embed-ok` result plus the decode
+  watchdog below.
 - `NATIVE_DECODE_WATCHDOG_MS` (5 s) grace timer while `engine === "VLC"`: if the
   250 ms clock never proves a real duration or advancing playhead
   (`nativeDecodeProvenRef`), cut back to HTML5. The watchdog reads the shared

@@ -32,6 +32,9 @@ src-tauri/binaries/
 # Private key (keep secret!)
 zanplayer-lite.key
 
+# Staged LibVLC for macOS bundling (scripts/bundle-vlc.sh)
+src-tauri/vendor/
+
 # Local machine backups
 backups/
 

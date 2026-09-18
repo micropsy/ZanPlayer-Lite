@@ -13,6 +13,30 @@ _No unreleased changes._
 
 ---
 
+## [0.1.6] — 2026-09-18
+
+### 🎬 Self-contained native playback on macOS
+
+Fixes the *"this fallback player can't decode it"* message on every shipped
+macOS build: the app's native engine is now bundled **inside** the `.app`, so
+MKV/AVI/WMV/FLV and every other catalogued container plays without requiring
+VLC.app on the user's Mac.
+
+- `scripts/bundle-vlc.sh` stages `libvlc.dylib` + `libvlccore.dylib` + the
+  full plugin tree from the build machine's VLC.app into the macOS bundle
+  (`Contents/Resources/vendor/vlc/`).
+- `build.rs` emits a bundle-first rpath (`@executable_path/../Resources/vendor/
+  vlc/lib`) before the system-VLC rpath, so installed apps load the embedded
+  engine while unbundled dev builds still resolve against VLC.app.
+- The plugin path resolver prefers the bundled tree, guaranteeing the loaded
+  libvlc and plugins share one version/arch.
+- The release workflow installs VLC, stages the engine, and builds the macOS
+  artifacts with `--features vlc-native`.
+- Result: the shipped macOS DMG/tar.gz self-contained native engine is proven
+  by the 10/10 native smoke test decoding an MKV with no system VLC present.
+
+---
+
 ## [0.1.5] — 2026-09-18
 
 ### 🛠️ Hardened subtitle parsing
@@ -105,6 +129,8 @@ macOS native engine.
 
 ---
 
-[Unreleased]: https://github.com/micropsy/ZanPlayer-Lite/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/micropsy/ZanPlayer-Lite/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/micropsy/ZanPlayer-Lite/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/micropsy/ZanPlayer-Lite/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/micropsy/ZanPlayer-Lite/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/micropsy/ZanPlayer-Lite/releases/tag/v0.1.3

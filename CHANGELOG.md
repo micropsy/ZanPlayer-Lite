@@ -13,6 +13,22 @@ _No unreleased changes._
 
 ---
 
+## [0.1.5] — 2026-09-18
+
+### 🛠️ Hardened subtitle parsing
+
+- **SRT/VTT import tolerates real-world files**: the parser no longer depends on
+  blank-line-separated blocks, so single-`\n` formatted SRTs, CRLF line endings,
+  index-less cues, and a leading UTF-8 BOM all import correctly.
+- **Cue timing is format-agnostic**: `,` or `.` millisecond separators, 1–3
+  digit fractions, and VTT cue settings after the end timestamp (e.g.
+  `align:start`) are all accepted; multi-line cue text is preserved.
+- **Numeric cue ordinals / VTT identifiers are never mistaken for subtitle
+  text**, and contiguous VTT cues (no blank line between them) are no longer
+  dropped.
+
+---
+
 ## [0.1.4] — 2026-09-17
 
 ### 🎬 Native playback engine: libmpv / CAMetalLayer → **LibVLC** (`vlc-native`)

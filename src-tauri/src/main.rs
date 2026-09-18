@@ -1095,60 +1095,64 @@ async fn read_subtitle_file(file_path: String) -> Result<Vec<SubtitleCue>, Strin
 }
 
 fn parse_srt(text: &str) -> Result<Vec<SubtitleCue>, String> {
-    let mut cues = Vec::new();
-    let blocks: Vec<&str> = text.trim().split("\n\n").collect();
-
-    for block in blocks {
-        let lines: Vec<&str> = block.lines().collect();
-        if lines.len() >= 3 {
-            let time_line = lines[1];
-            if let Some((start, end)) = parse_time_line(time_line, ',') {
-                let text = lines[2..].join("\n");
-                cues.push(SubtitleCue {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    start_time: start,
-                    end_time: end,
-                    text,
-                    kind: None,
-                });
-            }
-        }
-    }
-
-    Ok(cues)
+    Ok(parse_caption_text(text))
 }
 
 fn parse_vtt(text: &str) -> Result<Vec<SubtitleCue>, String> {
-    let mut cues = Vec::new();
+    Ok(parse_caption_text(text))
+}
+
+/// Shared SRT/VTT cue scanner that tolerates real-world formatting: CRLF line
+/// endings, a UTF-8 BOM, missing blank-line separators (single `\n` between
+/// cues), index-less cues, numeric cue ordinals/VTT identifiers, multi-line
+/// text, and VTT cue settings. A blank line or the next timing line closes a cue.
+fn parse_caption_text(text: &str) -> Vec<SubtitleCue> {
+    let text = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .replace("\r\n", "\n");
     let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
+    let mut cues = Vec::new();
+    let mut current: Option<(f64, f64)> = None;
+    let mut para: Vec<&str> = Vec::new();
 
-    while i < lines.len() && !lines[i].contains("-->") {
-        i += 1;
-    }
-
-    while i < lines.len() {
-        if lines[i].contains("-->") {
-            if let Some((start, end)) = parse_time_line(lines[i], '.') {
-                i += 1;
-                let mut text = String::new();
-                while i < lines.len() && !lines[i].is_empty() && !lines[i].contains("-->") {
-                    text += &format!("\n{}", lines[i]);
-                    i += 1;
-                }
-                cues.push(SubtitleCue {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    start_time: start,
-                    end_time: end,
-                    text: text.trim_start().to_string(),
-                    kind: None,
-                });
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.contains("-->") {
+            commit_caption_cue(&mut cues, current.take(), &para);
+            current = parse_time_line(trimmed);
+            para.clear();
+        } else if trimmed.is_empty() {
+            commit_caption_cue(&mut cues, current.take(), &para);
+            para.clear();
+        } else if current.is_some() {
+            let next_is_timing = lines
+                .get(i + 1)
+                .map(|next| next.trim().contains("-->"))
+                .unwrap_or(false);
+            let is_cue_ordinal = next_is_timing && trimmed.chars().all(|c| c.is_ascii_digit());
+            if !is_cue_ordinal {
+                para.push(trimmed);
             }
         }
-        i += 1;
     }
 
-    Ok(cues)
+    commit_caption_cue(&mut cues, current, &para);
+    cues
+}
+
+fn commit_caption_cue(cues: &mut Vec<SubtitleCue>, times: Option<(f64, f64)>, text: &[&str]) {
+    if let Some((start, end)) = times {
+        if !text.is_empty() {
+            cues.push(SubtitleCue {
+                id: uuid::Uuid::new_v4().to_string(),
+                start_time: start,
+                end_time: end,
+                text: text.join("\n"),
+                kind: None,
+            });
+        }
+    }
 }
 
 fn parse_ass(text: &str) -> Result<Vec<SubtitleCue>, String> {
@@ -1205,36 +1209,46 @@ fn parse_ass_time(s: &str) -> Result<f64, String> {
     }
 }
 
-fn parse_time_line(line: &str, sep: char) -> Option<(f64, f64)> {
+fn parse_time_line(line: &str) -> Option<(f64, f64)> {
     let parts: Vec<&str> = line.split("-->").collect();
     if parts.len() == 2 {
-        if let (Ok(start), Ok(end)) = (parse_time_str(parts[0].trim(), sep), parse_time_str(parts[1].trim(), sep)) {
+        if let (Ok(start), Ok(end)) = (parse_time_str(parts[0]), parse_time_str(parts[1])) {
             return Some((start, end));
         }
     }
     None
 }
 
-fn parse_time_str(s: &str, sep: char) -> Result<f64, String> {
-    let parts: Vec<&str> = s.split(sep).collect();
-    if parts.len() >= 2 {
-        let time_part = parts[0];
-        let frac_part = parts[1].chars().take(3).collect::<String>();
-        let frac = frac_part.parse::<f64>().unwrap_or(0.0) / 1000.0;
-        let hms: Vec<&str> = time_part.split(':').collect();
-        let mut total = 0.0;
-        if hms.len() == 3 {
-            total += hms[0].parse::<f64>().map_err(|e| e.to_string())? * 3600.0;
-            total += hms[1].parse::<f64>().map_err(|e| e.to_string())? * 60.0;
-            total += hms[2].parse::<f64>().map_err(|e| e.to_string())?;
-        } else if hms.len() == 2 {
-            total += hms[0].parse::<f64>().map_err(|e| e.to_string())? * 60.0;
-            total += hms[1].parse::<f64>().map_err(|e| e.to_string())?;
+// Parses `hh:mm:ss,fff` / `hh:mm:ss.fff` (hours/minutes optional, 1-3 digit
+// fraction, `,` OR `.` separator tolerated, VTT settings after the end stamp
+// like `align:start` ignored).
+fn parse_time_str(s: &str) -> Result<f64, String> {
+    let value = s.trim();
+    let (hms_part, frac) = match value.find([',', '.']) {
+        Some(idx) => {
+            let frac_digits: String = value[idx + 1..].chars().take(3).collect();
+            let divisor = match frac_digits.len() {
+                3 => 1000.0,
+                2 => 100.0,
+                _ => 10.0,
+            };
+            let frac = frac_digits.parse::<f64>().map_err(|e| e.to_string())? / divisor;
+            (&value[..idx], frac)
         }
-        Ok(total + frac)
-    } else {
-        Ok(0.0)
+        None => (value, 0.0),
+    };
+
+    let hms: Vec<&str> = hms_part.split(':').collect();
+    let mut total = 0.0;
+    if hms.len() == 3 {
+        total += hms[0].parse::<f64>().map_err(|e| e.to_string())? * 3600.0;
+        total += hms[1].parse::<f64>().map_err(|e| e.to_string())? * 60.0;
+        total += hms[2].parse::<f64>().map_err(|e| e.to_string())?;
+    } else if hms.len() == 2 {
+        total += hms[0].parse::<f64>().map_err(|e| e.to_string())? * 60.0;
+        total += hms[1].parse::<f64>().map_err(|e| e.to_string())?;
     }
+    Ok(total + frac)
 }
 
 #[tauri::command]
@@ -1534,6 +1548,54 @@ mod tests {
         assert_eq!(cues[0].text, "Hi there");
         assert!((cues[0].start_time - 1.0).abs() < 1e-9);
         assert!(cues[0].kind.is_none());
+    }
+
+    #[test]
+    fn srt_parser_handles_single_newline_separators_and_crlf() {
+        let srt = "1\r\n00:00:01,000 --> 00:00:03,500\r\nHello world\r\n2\r\n00:00:04,000 --> 00:00:06,000\r\nSecond cue\r\n";
+        let cues = parse_srt(srt).unwrap();
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "Hello world");
+        assert_eq!(cues[1].text, "Second cue");
+        assert!((cues[1].start_time - 4.0).abs() < 1e-9);
+        assert!((cues[1].end_time - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn srt_parser_handles_indexless_and_bom_cues() {
+        let srt = "\u{feff}00:00:01,000 --> 00:00:03,500\nHello world\n00:00:04,000 --> 00:00:06,000\nSecond cue\n";
+        let cues = parse_srt(srt).unwrap();
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "Hello world");
+        assert_eq!(cues[1].text, "Second cue");
+    }
+
+    #[test]
+    fn srt_parser_tolerates_millisecond_dots_and_short_fractions() {
+        let srt = "1\n00:00:01.500 --> 00:00:03.75\nHello\n";
+        let cues = parse_srt(srt).unwrap();
+        assert_eq!(cues.len(), 1);
+        assert!((cues[0].start_time - 1.5).abs() < 1e-9);
+        assert!((cues[0].end_time - 3.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn srt_parser_keeps_multi_line_cue_text() {
+        let srt = "00:00:01,000 --> 00:00:05,000\nFirst line\nSecond line\n";
+        let cues = parse_srt(srt).unwrap();
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "First line\nSecond line");
+    }
+
+    #[test]
+    fn vtt_parser_handles_contiguous_identifiers_and_cue_settings() {
+        let vtt = "WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.500 align:start\nHi\n2\n00:00:03.000 --> 00:00:04.500\nThere\n";
+        let cues = parse_vtt(vtt).unwrap();
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "Hi");
+        assert_eq!(cues[1].text, "There");
+        assert!((cues[1].start_time - 3.0).abs() < 1e-9);
+        assert!((cues[1].end_time - 4.5).abs() < 1e-9);
     }
 
     // -- Project save/load ---------------------------------------------------
